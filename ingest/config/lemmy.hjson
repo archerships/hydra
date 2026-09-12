@@ -1,0 +1,24 @@
+{
+  # For more info on the configuration, check out the documentation at:
+  # https://join-lemmy.org/docs/en/administration/configuration.html
+
+  database: {
+    host: postgres
+    password: password
+    user: lemmy
+    database: lemmy
+    pool_size: 5
+  }
+  hostname: localhost:8536
+  bind: 0.0.0.0
+  port: 8536
+  tls_enabled: false
+  setup: {
+    admin_username: admin
+    admin_password: admin_password
+    site_name: Hydra Nexus
+  }
+  pictrs: {
+    url: "http://pictrs:8080/"
+  }
+}

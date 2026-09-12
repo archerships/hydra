@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# lemmy-vid-shrink — Shrink video for Lemmy (H.264/MP4, max 50MB).
+# Optimized for high quality within Lemmy/Pictrs limits.
+
+MAX_SIZE_MB=50
+OUTPUT_DIR="/tmp/nexus-videos"
+INPUT_FILE=""
+
+show_help() {
+    cat << 'EOF'
+lemmy-vid-shrink — Optimized video shrinking for Lemmy
+
+USAGE
+    lemmy-vid-shrink [OPTIONS] FILE
+
+DESCRIPTION
+    Compresses video to H.264/MP4 at 720p (if source allows) or 480p.
+    Attempts to keep file size under 50MB.
+    Outputs the path of the shrunk file.
+EOF
+}
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -h|--help) show_help; exit 0 ;;
+        *) INPUT_FILE="$1"; shift ;;
+    esac
+done
+
+if [[ -z "$INPUT_FILE" || ! -f "$INPUT_FILE" ]]; then
+    echo "Error: Valid input file required." >&2
+    exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR"
+BASE_NAME=$(basename "${INPUT_FILE%.*}")
+TIMESTAMP=$(date +%s)
+OUTPUT_FILE="${OUTPUT_DIR}/${BASE_NAME}_${TIMESTAMP}_lemmy.mp4"
+
+# Logic:
+# 1. Start with 720p, CRF 24 (High quality)
+# Ensure standard profile and level for web compatibility
+ffmpeg -i "$INPUT_FILE" \
+  -c:v libx264 -crf 24 -preset faster -profile:v high -level:v 4.0 \
+  -vf "scale='if(gt(iw,ih),-2,min(720,ih))':'if(gt(iw,ih),min(720,ih),-2)',format=yuv420p" \
+  -c:a aac -b:a 128k \
+  -movflags +faststart \
+  -y -hide_banner -loglevel error \
+  "$OUTPUT_FILE"
+
+FILE_SIZE_B=$(stat -f%z "$OUTPUT_FILE")
+MAX_SIZE_B=$(( MAX_SIZE_MB * 1024 * 1024 ))
+
+if (( FILE_SIZE_B > MAX_SIZE_B )); then
+    # Re-shrink to 480p if still too large
+    ffmpeg -i "$OUTPUT_FILE" \
+      -c:v libx264 -crf 30 -preset faster \
+      -vf "scale='if(gt(iw,ih),-2,480)':'if(gt(iw,ih),480,-2)',format=yuv420p" \
+      -c:a copy \
+      -y -hide_banner -loglevel error \
+      "${OUTPUT_FILE}.tmp.mp4"
+    mv "${OUTPUT_FILE}.tmp.mp4" "$OUTPUT_FILE"
+fi
+
+echo "$OUTPUT_FILE"

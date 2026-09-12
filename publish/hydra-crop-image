@@ -1,0 +1,164 @@
+#!/Users/crasch/av/venv/hydra/bin/python3
+"""hydra-crop-image — Center-crop a source image to a target platform's aspect ratio.
+
+Decides whether to crop based on edge uniformity:
+- If edges are uniform background (80%+ pixels within delta=15 of dominant color): crop.
+- Otherwise: leave unchanged (caller should pad when adapting).
+
+Usage:
+  hydra-crop-image <source> <context> [--out <path>] [--threshold 0.8] [--delta 15]
+
+Contexts and their aspect ratios are imported from hydra-adapt-image.
+Writes the cropped (or unchanged) image to --out.
+Exit 0 if cropped, exit 3 if skipped (edge would lose content).
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+from PIL import Image
+
+# Mirror hydra-adapt-image contexts
+CONTEXTS: dict[str, tuple[int, int]] = {
+    'twitter-post':       (1200,  675),
+    'twitter-article':    (1200,  480),
+    'facebook-landscape': (1200,  630),
+    'facebook-portrait':  (1080, 1350),
+    'substack-note':      (1200,  675),
+    'substack-cover':     (1200,  600),
+    'nostr-short':        (1200,  675),
+    'nostr-article':      (1200,  675),
+}
+
+
+def dominant_edge_color(img: Image.Image, edge_width: int = 20) -> tuple[int, int, int]:
+    """Return the most common color in the outer edge_width pixels of 'img'."""
+    w, h = img.size
+    pixels = []
+    # top edge
+    for y in range(edge_width):
+        for x in range(w):
+            pixels.append(img.getpixel((x, y)))
+    # bottom edge
+    for y in range(h - edge_width, h):
+        for x in range(w):
+            pixels.append(img.getpixel((x, y)))
+    # left edge
+    for y in range(edge_width, h - edge_width):
+        for x in range(edge_width):
+            pixels.append(img.getpixel((x, y)))
+    # right edge
+    for y in range(edge_width, h - edge_width):
+        for x in range(w - edge_width, w):
+            pixels.append(img.getpixel((x, y)))
+    # most frequent
+    from collections import Counter
+    return Counter(pixels).most_common(1)[0][0]
+
+
+def edge_is_uniform(img: Image.Image, dominant: tuple[int, int, int],
+                    delta: int = 15, threshold: float = 0.8) -> bool:
+    """Return True if >= threshold fraction of edge pixels are within delta of dominant."""
+    w, h = img.size
+    total = 0
+    match = 0
+    for y in range(h):
+        if y > 20 and y < h - 20:
+            continue  # only sample edge bands
+        for x in range(w):
+            if x > 20 and x < w - 20:
+                # skip interior of row — only edges of edge band? No, scan full edge band.
+                pass
+    # Simpler: sample 4 edge strips
+    samples = []
+    # top strip
+    for y in range(min(20, h)):
+        for x in range(w):
+            samples.append(img.getpixel((x, y)))
+    # bottom strip
+    for y in range(max(0, h - 20), h):
+        for x in range(w):
+            samples.append(img.getpixel((x, y)))
+    # left strip
+    for y in range(20, max(20, h - 20)):
+        for x in range(min(20, w)):
+            samples.append(img.getpixel((x, y)))
+    # right strip
+    for y in range(20, max(20, h - 20)):
+        for x in range(max(0, w - 20), w):
+            samples.append(img.getpixel((x, y)))
+
+    if not samples:
+        return True  # very small image — safe to crop
+    match = sum(1 for p in samples if all(abs(p[i] - dominant[i]) <= delta for i in range(3)))
+    return match / len(samples) >= threshold
+
+
+def crop_to_aspect(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """Center-crop img to match target_w:target_h aspect ratio. Returns new Image."""
+    src_w, src_h = img.size
+    target_aspect = target_w / target_h
+    src_aspect = src_w / src_h
+
+    if src_aspect > target_aspect:
+        # image is wider — crop sides
+        new_w = int(src_h * target_aspect)
+        left = (src_w - new_w) // 2
+        return img.crop((left, 0, left + new_w, src_h))
+    elif src_aspect < target_aspect:
+        # image is taller — crop top/bottom
+        new_h = int(src_w / target_aspect)
+        top = (src_h - new_h) // 2
+        return img.crop((0, top, src_w, top + new_h))
+    else:
+        return img.copy()  # already matching
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Crop image to platform aspect ratio (if safe)")
+    parser.add_argument("source", help="Source image path")
+    parser.add_argument("context", choices=sorted(CONTEXTS),
+                        help="Target platform context")
+    parser.add_argument("--out", "-o", required=True, help="Output path")
+    parser.add_argument("--threshold", type=float, default=0.8,
+                        help="Fraction of edge pixels that must match dominant (default: 0.8)")
+    parser.add_argument("--delta", type=int, default=15,
+                        help="Max color delta for edge match (default: 15)")
+    parser.add_argument("--force", action="store_true",
+                        help="Crop even if edges are not uniform")
+    args = parser.parse_args()
+
+    src = Path(os.path.expanduser(args.source))
+    if not src.exists():
+        sys.exit(f"Source not found: {src}")
+
+    img = Image.open(src).convert("RGB")
+    tw, th = CONTEXTS[args.context]
+    src_aspect = img.size[0] / img.size[1]
+    target_aspect = tw / th
+
+    if abs(src_aspect - target_aspect) < 0.005:
+        # Already correct ratio — just copy
+        img.save(args.out)
+        print(f"Same aspect ratio ({src_aspect:.3f} ≈ {target_aspect:.3f}) — copied unchanged")
+        return
+
+    if not args.force:
+        dominant = dominant_edge_color(img)
+        uniform = edge_is_uniform(img, dominant, delta=args.delta, threshold=args.threshold)
+        if not uniform:
+            print(f"Edges not uniform — cropping would lose content. Use --force to override.")
+            print(f"  dominant: {dominant}, match fraction below {args.threshold}")
+            img.save(args.out)
+            sys.exit(3)
+
+    cropped = crop_to_aspect(img, tw, th)
+    cropped.save(args.out)
+    print(f"Cropped {img.size[0]}x{img.size[1]} -> {cropped.size[0]}x{cropped.size[1]} "
+          f"(aspect {target_aspect:.3f}) for {args.context}")
+
+
+if __name__ == "__main__":
+    main()

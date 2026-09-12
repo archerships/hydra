@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# lj-import -- Full archive of a LiveJournal account via ljdump.
+#
+# Downloads all journal entries and comments using the LJ XML-RPC API,
+# then processes them into the archerships.com posts format.
+#
+# Requires a ljdump.config file. ljdump tracks its own checkpoint and will
+# only fetch entries not yet saved; safe to re-run.
+#
+# Usage: lj-import [--config FILE] [--no-process]
+#
+# Options:
+#   --config FILE   ljdump config file (default: ~/av/bin/ljdump/ljdump.config)
+#   --no-process    Download only; skip archerships.com post processing
+#
+# Output:
+#   Raw XML entries:  ~/av/doc/livejournal/{username}/
+#   Processed posts:  ~/av/prj/archerships.com/src/posts/ (public)
+#                     ~/av/prj/archerships.com/src/private/lj/ (private/friends)
+
+set -euo pipefail
+
+LJDUMP="${HOME}/av/bin/ljdump/ljdump.py"
+IMPORT_SCRIPT="${HOME}/av/prj/archerships.com/scripts/import-livejournal.py"
+DEFAULT_CONFIG="${HOME}/av/bin/ljdump/ljdump.config"
+LJ_DOC_DIR="${HOME}/av/doc/livejournal"
+
+CONFIG="${DEFAULT_CONFIG}"
+PROCESS=true
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --config) CONFIG="$2"; shift 2 ;;
+        --no-process) PROCESS=false; shift ;;
+        -h|--help)
+            sed -n '2,/^$/p' "$0" | grep '^#' | sed 's/^# \?//'
+            exit 0
+            ;;
+        *) echo "[lj-import] Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [[ ! -f "${CONFIG}" ]]; then
+    echo "[lj-import] ERROR: config not found at ${CONFIG}" >&2
+    echo "[lj-import] Copy ${DEFAULT_CONFIG}.sample to ${CONFIG} and fill in credentials." >&2
+    exit 1
+fi
+
+mkdir -p "${LJ_DOC_DIR}"
+
+echo "[lj-import] Running ljdump (checkpoint-aware; fetches only new entries)..."
+cd "${LJ_DOC_DIR}"
+python3 "${LJDUMP}" --config "${CONFIG}"
+
+if [[ "${PROCESS}" == true ]]; then
+    if [[ ! -f "${IMPORT_SCRIPT}" ]]; then
+        echo "[lj-import] WARNING: ${IMPORT_SCRIPT} not found; skipping post processing." >&2
+    else
+        echo "[lj-import] Processing entries into archerships.com posts..."
+        EXPORT_DIR=$(grep -oP '(?<=<username>)[^<]+' "${CONFIG}" | head -1)
+        python3 "${IMPORT_SCRIPT}" --export "${LJ_DOC_DIR}/${EXPORT_DIR}"
+    fi
+fi
+
+echo "[lj-import] Done."

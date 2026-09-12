@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# tw-archive -- Unified Twitter/X Archiver (v2.0)
+# Managed via Nix for reproducible dependencies.
+
+nix shell \
+  nixpkgs#python313Packages.httpx \
+  nixpkgs#python313Packages.beautifulsoup4 \
+  nixpkgs#python313Packages.warcio \
+  nixpkgs#python313Packages.playwright \
+  nixpkgs#python313Packages.aiohttp \
+  --command python3 /Users/crasch/av/prj/twitness/src/tw-archive.py "$@"

@@ -1,0 +1,26 @@
+# Hydra Nexus - example bridge config.
+# Copy to matterbridge.toml and fill in YOUR OWN credentials.
+# Never commit the real file.
+
+[matrix.nexus]
+Server="http://localhost:6167"
+Login="CHANGEME" # Create this account on your local Conduit
+Password="CHANGEME"
+NoSSL=true
+
+[telegram.main]
+Token="CHANGEME"
+RemoteNickFormat="[{PROTOCOL}] <{NICK}> "
+
+[[gateway]]
+name="hydra-nexus"
+
+    # Telegram input
+    [[gateway.inout]]
+    account="telegram.main"
+    channel="CHANGEME"
+
+    # Matrix output
+    [[gateway.inout]]
+    account="matrix.nexus"
+    channel="#archive:localhost" # Create this room in Matrix

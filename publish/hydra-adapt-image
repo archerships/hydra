@@ -1,0 +1,141 @@
+#!/Users/crasch/av/venv/hydra/bin/python3
+"""
+hydra-adapt-image -- Adapt a source image to platform-specific dimensions.
+
+Scales the source image to fit entirely within the target canvas (no crop),
+centers it, and fills the remainder with black. See pol/SOCIAL-SETTINGS.md §2.
+
+Usage:
+  hydra-adapt-image <source> <context> [--out <path>] [--format png|jpg] [--quality 92]
+  hydra-adapt-image <source> all       [--out-dir <dir>]  [--format png|jpg] [--quality 92]
+
+Contexts:
+  twitter-post        1200 x 675   16:9
+  twitter-article     1200 x 480   5:2
+  facebook-landscape  1200 x 630   1.91:1
+  facebook-portrait   1080 x 1350  4:5
+  substack-note       1200 x 675   16:9
+  substack-cover      1200 x 600   2:1
+  nostr-short         1200 x 675   16:9
+  nostr-article       1200 x 675   16:9
+
+  all                 Generate every context above in one pass.
+                      Outputs named {stem}-{context}-{W}x{H}.{ext} per
+                      pol/WRITING.md §3 naming convention.
+                      Use --out-dir to control destination (default: ~/av/tmp/).
+
+Single-context output path defaults to ~/av/tmp/hydra-img-<context>.<ext>
+
+Requirements:
+  pip install pillow
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+from PIL import Image
+
+sys.stdout.reconfigure(line_buffering=True)
+
+TMP_DIR = Path.home() / 'av' / 'tmp'
+
+CONTEXTS: dict[str, tuple[int, int]] = {
+    'twitter-post':       (1200,  675),
+    'twitter-article':    (1200,  480),
+    'facebook-landscape': (1200,  630),
+    'facebook-portrait':  (1080, 1350),
+    'substack-note':      (1200,  675),
+    'substack-cover':     (1200,  600),
+    'nostr-short':        (1200,  675),
+    'nostr-article':      (1200,  675),
+}
+
+# Contexts that default to JPG output
+_JPG_CONTEXTS = {'facebook-landscape', 'facebook-portrait', 'substack-cover'}
+
+# Contexts skipped in 'all' mode because they are identical to another context
+# (avoids writing 4 identical copies of the 16:9 variant).
+# twitter-post is the canonical 16:9 output; the others are aliases.
+_ALL_SKIP = {'substack-note', 'nostr-short', 'nostr-article'}
+
+
+def adapt(src: Path, w: int, h: int, out: Path, fmt: str, quality: int) -> None:
+    img = Image.open(src).convert('RGB')
+    exif = img.info.get('exif')  # preserve metadata (e.g. EXIF prompt) through scale
+    img.thumbnail((w, h), Image.LANCZOS)
+    canvas = Image.new('RGB', (w, h), (0, 0, 0))
+    offset = ((w - img.width) // 2, (h - img.height) // 2)
+    canvas.paste(img, offset)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    save_kwargs: dict = {}
+    if exif is not None:
+        save_kwargs['exif'] = exif
+    if fmt == 'jpg':
+        canvas.save(out, 'JPEG', quality=quality, optimize=True, **save_kwargs)
+    else:
+        canvas.save(out, 'PNG', optimize=True, **save_kwargs)
+    print(f'{out}')
+
+
+def _fmt_for(context: str, src: Path, format_override: str | None) -> str:
+    if format_override:
+        return format_override
+    if context in _JPG_CONTEXTS:
+        return 'jpg'
+    return 'jpg' if src.suffix.lower() in ('.jpg', '.jpeg') else 'png'
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Adapt a source image to platform-specific dimensions.'
+    )
+    parser.add_argument('source', help='Source image path')
+    parser.add_argument('context', choices=sorted(CONTEXTS) + ['all'],
+                        help='Platform context, or "all" to generate every variant')
+    parser.add_argument('--out', '-o',
+                        help='Output path for single-context mode '
+                             '(default: ~/av/tmp/hydra-img-<context>.<ext>)')
+    parser.add_argument('--out-dir', '-d',
+                        help='Output directory for "all" mode '
+                             '(default: ~/av/tmp/). '
+                             'Files named {stem}-{context}-{W}x{H}.{ext}')
+    parser.add_argument('--format', '-f', choices=['png', 'jpg'],
+                        help='Output format (default: jpg for facebook/substack-cover, '
+                             'else matches source)')
+    parser.add_argument('--quality', '-q', type=int, default=92,
+                        help='JPG quality 1-95 (default: 92)')
+    args = parser.parse_args()
+
+    src = Path(os.path.expanduser(args.source))
+    if not src.exists():
+        sys.exit(f'Source not found: {src}')
+
+    if args.context == 'all':
+        out_dir = Path(os.path.expanduser(args.out_dir)) if args.out_dir else TMP_DIR
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = src.stem
+        for ctx, (w, h) in CONTEXTS.items():
+            if ctx in _ALL_SKIP:
+                continue
+            fmt = _fmt_for(ctx, src, args.format)
+            out = out_dir / f'{stem}-{ctx}-{w}x{h}.{"jpg" if fmt == "jpg" else "png"}'
+            adapt(src, w, h, out, fmt, args.quality)
+        return
+
+    w, h = CONTEXTS[args.context]
+    fmt = _fmt_for(args.context, src, args.format)
+
+    if args.out:
+        out = Path(os.path.expanduser(args.out))
+    else:
+        ext = 'jpg' if fmt == 'jpg' else 'png'
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        out = TMP_DIR / f'hydra-img-{args.context}.{ext}'
+
+    adapt(src, w, h, out, fmt, args.quality)
+
+
+if __name__ == '__main__':
+    main()

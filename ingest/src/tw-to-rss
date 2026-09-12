@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""
+tw-to-rss -- Convert a Twitter List or User to RSS using local cookies.
+
+SYNOPSIS
+    tw-to-rss <list|user> <id_or_handle>
+
+DESCRIPTION
+    Uses gallery-dl (via Nix) combined with exported Brave browser cookies
+    to perform authenticated scraping of Twitter lists or user timelines.
+    The output is a standard RSS 2.0 XML feed printed to stdout.
+
+    Requires cookies to be exported to ~/.newsboat/cookies.txt (use
+    brave-cookies-export).
+
+OPTIONS
+    -h, --help    Show this help message.
+
+EXAMPLES
+    tw-to-rss list 1631502616206389250
+    tw-to-rss user flwrlabs
+"""
+
+import sys
+import json
+import subprocess
+import html
+
+def get_rss(items, title):
+    rss = [
+        '<?xml version="1.0" encoding="UTF-8" ?>',
+        '<rss version="2.0">',
+        '<channel>',
+        f'<title>{title}</title>',
+        '<description>Generated via tw-to-rss</description>',
+        '<link>https://x.com</link>'
+    ]
+
+    for item in items:
+        try:
+            if not isinstance(item, list) or item[0] != 'item':
+                continue
+            
+            meta = item[2]
+            tweet_id = meta.get('tweet_id')
+            content = meta.get('content', '')
+            author = meta.get('author', {}).get('nick', 'Twitter')
+            date_str = meta.get('date')
+            
+            url = f"https://x.com/i/web/status/{tweet_id}"
+            
+            rss.append('<item>')
+            rss.append(f'<title>[{author}] {html.escape(content[:100])}...</title>')
+            rss.append(f'<link>{url}</link>')
+            rss.append(f'<description>{html.escape(content)}</description>')
+            if date_str:
+                rss.append(f'<pubDate>{date_str}</pubDate>')
+            rss.append('</item>')
+        except Exception:
+            continue
+
+    rss.append('</channel></rss>')
+    return '\n'.join(rss)
+
+def main():
+    if len(sys.argv) < 3 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        sys.exit(0 if len(sys.argv) > 1 else 1)
+
+    mode = sys.argv[1]
+    target = sys.argv[2]
+    
+    url = f"https://x.com/i/lists/{target}" if mode == "list" else f"https://x.com/{target}"
+
+    # Construct gallery-dl command
+    # -j: JSON output
+    # --cookies: Use Brave exported cookies
+    cmd = [
+        "nix", "shell", "nixpkgs#gallery-dl", "--command", "gallery-dl",
+        "-j",
+        "--cookies", "/Users/crasch/.newsboat/cookies.txt",
+        "--range", "1-10",
+        url
+    ]
+
+    try:
+        # Run with shell=False for safety
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            # Fallback to pure shell command if nix shell is causing issues in subproc
+            result = subprocess.run(f"nix shell nixpkgs#gallery-dl --command gallery-dl -j --cookies /Users/crasch/.newsboat/cookies.txt --range 1-10 {url}", 
+                                   shell=True, capture_output=True, text=True)
+
+        # Filter for valid JSON lines only
+        json_items = []
+        for line in result.stdout.strip().split('\n'):
+            line = line.strip()
+            if line.startswith('[') and line.endswith(']'):
+                try:
+                    json_items.append(json.loads(line))
+                except:
+                    continue
+        
+        if not json_items:
+            # If no JSON found, output error feed
+            print(get_rss([], f"Error: No data found for {target}"))
+            sys.exit(0)
+
+        print(get_rss(json_items, f"Twitter {mode.capitalize()}: {target}"))
+        
+    except Exception as e:
+        print(get_rss([], f"System Error: {str(e)}"))
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""
+fb-sync -- Incremental sync of new Facebook posts since last import.
+
+Facebook removed public API access to Page and personal post content in 2018.
+Automated sync without a developer token is not possible via official means.
+
+PRACTICAL OPTIONS:
+
+1. Re-run fb-import with a fresh DYI export (recommended).
+   Facebook now allows requesting a partial export (custom date range), which
+   makes this fast for recent posts:
+   Settings > Your Facebook information > Download your information
+   Set date range to cover only the period since your last import.
+
+2. For Pages with the Graph API enabled (requires Meta Business Suite approval):
+   Set FB_PAGE_ID and FB_PAGE_TOKEN environment variables and run with --api.
+   This requires a Page Access Token with pages_read_engagement permission.
+
+3. CDP-based scraping via Brave is unreliable for bulk sync and is not
+   implemented here. Use fb-edit-post.py for targeted single-post operations.
+
+Usage:
+  fb-sync.py                    Print this message and exit
+  fb-sync.py --api              Fetch via Graph API (requires tokens)
+  fb-sync.py --since YYYY-MM-DD Limit API fetch to posts after this date
+
+Environment variables (--api mode):
+  FB_PAGE_ID      Numeric Page ID
+  FB_PAGE_TOKEN   Page Access Token (pages_read_engagement scope)
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+OUT_BASE = Path.home() / "av/doc/facebook/page-posts"
+CHECKPOINT = Path.home() / "av/doc/facebook/.last-sync"
+GRAPH_API = "https://graph.facebook.com/v19.0"
+
+
+def load_checkpoint() -> str | None:
+    if CHECKPOINT.exists():
+        return CHECKPOINT.read_text().strip()
+    return None
+
+
+def write_checkpoint(iso: str) -> None:
+    CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT.write_text(iso)
+
+
+def fetch_page_posts(page_id: str, token: str, since: str | None) -> list[dict]:
+    fields = "id,message,story,created_time,full_picture,permalink_url"
+    url = f"{GRAPH_API}/{page_id}/posts?fields={fields}&access_token={token}&limit=100"
+    if since:
+        import time
+        ts = int(datetime.fromisoformat(since).timestamp())
+        url += f"&since={ts}"
+
+    posts = []
+    while url:
+        with urllib.request.urlopen(url) as resp:
+            data = json.loads(resp.read())
+        posts.extend(data.get("data", []))
+        url = data.get("paging", {}).get("next")
+
+    return posts
+
+
+def save_post(post: dict, out_dir: Path) -> str:
+    created = post.get("created_time", "")
+    ts = created[:10] if created else "unknown"
+    post_id = post.get("id", "").replace("_", "-")
+    slug = f"{ts}-{post_id}"
+    post_path = out_dir / slug
+    post_path.mkdir(parents=True, exist_ok=True)
+
+    (post_path / "post.json").write_text(
+        json.dumps(post, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    msg = post.get("message") or post.get("story") or ""
+    if msg:
+        (post_path / "body.txt").write_text(msg, encoding="utf-8")
+
+    return created
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Incremental Facebook Page sync")
+    parser.add_argument("--api", action="store_true", help="Use Graph API")
+    parser.add_argument("--since", help="Fetch posts after YYYY-MM-DD (overrides checkpoint)")
+    args = parser.parse_args()
+
+    if not args.api:
+        print(__doc__)
+        print("\n[fb-sync] No action taken. Use --api or re-run fb-import with a new DYI export.")
+        sys.exit(0)
+
+    page_id = os.environ.get("FB_PAGE_ID")
+    token = os.environ.get("FB_PAGE_TOKEN")
+    if not page_id or not token:
+        print("[fb-sync] ERROR: FB_PAGE_ID and FB_PAGE_TOKEN must be set.", file=sys.stderr)
+        sys.exit(1)
+
+    since = args.since or load_checkpoint()
+    if since:
+        print(f"[fb-sync] Fetching posts since {since}...")
+    else:
+        print("[fb-sync] No checkpoint; fetching up to 100 recent posts...")
+
+    OUT_BASE.mkdir(parents=True, exist_ok=True)
+
+    posts = fetch_page_posts(page_id, token, since)
+    print(f"[fb-sync] {len(posts)} posts found.")
+
+    newest = None
+    for post in posts:
+        created = save_post(post, OUT_BASE)
+        if created and (newest is None or created > newest):
+            newest = created
+        print(f"  [OK] {post.get('id')}")
+
+    if newest:
+        write_checkpoint(newest)
+        print(f"[fb-sync] Checkpoint updated: {newest}")
+
+    print("[fb-sync] Done.")
+
+
+if __name__ == "__main__":
+    main()

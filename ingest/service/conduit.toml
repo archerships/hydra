@@ -1,0 +1,12 @@
+[global]
+server_name = "localhost"
+port = 6167
+database_path = "./data"
+database_backend = "rocksdb"
+allow_registration = true
+allow_federation = false
+max_request_size = 20_000_000
+address = "127.0.0.1"
+
+[log]
+filter = "warn,conduit=info"

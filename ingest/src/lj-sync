@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# lj-sync -- Incremental sync of a LiveJournal account (new entries only).
+#
+# Functionally identical to lj-import: ljdump tracks its own high-water mark
+# and fetches only entries created since the last run. Running this script
+# regularly keeps the local archive current.
+#
+# Use lj-import for first-time setup (it also runs the post processor).
+# Use lj-sync for regular cron/launchd runs.
+#
+# Usage: lj-sync [--config FILE] [--no-process]
+#
+# Options:
+#   --config FILE   ljdump config file (default: ~/av/bin/ljdump/ljdump.config)
+#   --no-process    Download only; skip archerships.com post processing
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+exec "${SCRIPT_DIR}/lj-import" "$@"

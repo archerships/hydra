@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# tw-list-feed -- Generate a working Nitter RSS URL for a Twitter List ID.
+
+show_help() {
+    cat << 'EOF'
+tw-list-feed -- Generate a working Nitter RSS URL for a Twitter List ID.
+
+SYNOPSIS
+    tw-list-feed <LIST_ID>
+
+DESCRIPTION
+    Probes a list of known Nitter instances to find one that is currently
+    serving a valid RSS feed for the provided Twitter List ID.
+
+    Outputs the first working URL found.
+
+OPTIONS
+    -h, --help    Show this help message.
+
+EXAMPLES
+    tw-list-feed 1631502616206389250
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    show_help
+    exit 0
+fi
+
+LIST_ID="${1:-}"
+
+if [[ -z "$LIST_ID" ]]; then
+    show_help
+    exit 1
+fi
+
+NITTER_INSTANCES=(
+    "nitter.net"
+    "nitter.privacyredirect.com"
+    "nitter.tiekoetter.com"
+    "nitter.aishiteiru.moe"
+    "nitter.1d4.us"
+    "nitter.poast.org"
+)
+
+for inst in "${NITTER_INSTANCES[@]}"; do
+    URL="https://${inst}/i/lists/${LIST_ID}/rss"
+    if curl -sfL --max-time 5 "$URL" | grep -q '<item>' ; then
+        echo "$URL"
+        exit 0
+    fi
+done
+
+echo "Error: No live Nitter instances found for this list." >&2
+exit 1

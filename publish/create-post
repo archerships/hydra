@@ -1,0 +1,141 @@
+#!/Users/crasch/av/venv/hydra/bin/python3
+"""
+create-post -- Create a new essay stub for archerships.com
+
+Usage:
+  python3 scripts/create-post "My Essay Title" [--subtitle "Optional subtitle"] [--section acceleration]
+
+Creates:
+  ~/av/doc/posts/YYYY-MM-DD-my-essay-title/
+    YYYY-MM-DD-my-essay-title.md        # Frontmatter + empty body
+    YYYY-MM-DD-my-essay-title.html      # HTML template stub
+
+Then reminds you what to do next.
+"""
+
+import argparse
+import os
+import sys
+import re
+from datetime import date
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+sys.path.insert(0, str(SCRIPT_DIR))
+from hydra_paths import SCRIPTS_DIR
+ESSAYS_DIR = Path.home() / 'av' / 'doc' / 'posts'
+SERIAL_BIN = Path.home() / 'av' / 'bin' / 'serial'
+
+SECTIONS = {
+    'acceleration': 'Acceleration Nation',
+    'seasteading': 'Practical Seasteading',
+    'anarchism': 'Anarchism & Voluntaryism',
+    'tech': 'Technology & Guides',
+    'philosophy': 'Philosophy & Culture',
+    'liberty': 'Liberty & Politics',
+    'personal': 'Personal',
+}
+
+SECTION_DESC = {
+    'acceleration': 'Essays on accelerationism, libertarianism, crypto, pronatalism, and more.',
+    'seasteading': 'Hands-on guides for living and building at sea.',
+    'anarchism': 'Essays on anarchism, voluntaryism, and stateless societies.',
+    'tech': 'Technical guides, tutorials, and tooling.',
+    'philosophy': 'Philosophical essays on culture, ethics, and human flourishing.',
+    'liberty': 'Political commentary and analysis.',
+    'personal': 'Personal reflections, letters, and miscellany.',
+}
+
+
+def slugify(title: str) -> str:
+    s = title.lower().strip()
+    s = re.sub(r'[^a-z0-9\s-]', '', s)
+    s = re.sub(r'\s+', '-', s)
+    s = re.sub(r'-+', '-', s)
+    return s.strip('-')
+
+
+def make_frontmatter(title: str, subtitle: str, section: str, serial: str = '') -> str:
+    today = date.today().isoformat()
+    slug = slugify(title)
+
+    lines = [
+        '---',
+        'type: long-form',
+        'purpose: explainer',
+        f'title: "{title}"',
+    ]
+    if subtitle:
+        lines.append(f'subtitle: "{subtitle}"')
+    else:
+        lines.append('subtitle: ""')
+    if serial:
+        lines.append(f'serial: {serial}')
+    lines.append(f'description: "{title} -- archerships"')
+    lines.append(f"date: '{today}'")
+    if section:
+        lines.append(f'section: {section}')
+    lines.append('tags: []')
+    lines.append('ai_percentage: 0')
+    lines.append('published_at: []')
+    lines.append('---')
+    lines.append('')
+    lines.append('')
+    return '\n'.join(lines)
+
+
+def next_serial() -> str:
+    """Mint the next post serial via bin/serial (YYYY-A-NNNN)."""
+    import subprocess
+    proc = subprocess.run([str(SERIAL_BIN), '--year', date.today().strftime('%Y')],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(f"Warning: could not mint serial ({proc.stderr.strip()}); continuing without one",
+              file=sys.stderr)
+        return ''
+    return proc.stdout.strip()
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Create a new essay stub for archerships.com')
+    parser.add_argument('title', help='Essay title')
+    parser.add_argument('--subtitle', '-s', default='', help='Optional subtitle')
+    parser.add_argument('--section', default='acceleration',
+                        choices=list(SECTIONS.keys()),
+                        help=f'Section category (default: acceleration)')
+
+    args = parser.parse_args()
+    today = date.today()
+    slug = slugify(args.title)
+    serial = next_serial()
+    # New posts carry the serial in the directory/filename (YYYY-A-NNNN-YYYY-MM-DD-slug).
+    serial_prefix = f'{serial}-' if serial else ''
+    dirname = f'{serial_prefix}{today.isoformat()}-{slug}'
+    essay_dir = ESSAYS_DIR / dirname
+
+    if essay_dir.exists():
+        print(f"Error: {essay_dir} already exists!")
+        sys.exit(1)
+
+    essay_dir.mkdir(parents=True, exist_ok=True)
+
+    source_md = essay_dir / f'{serial_prefix}{today.isoformat()}-{slug}.md'
+    md_content = make_frontmatter(args.title, args.subtitle, args.section, serial)
+    source_md.write_text(md_content)
+
+    print(f"Created: {essay_dir}")
+    print(f"  {source_md.name}")
+    print(f"  serial: {serial or '(none)'}")
+    print()
+    print("Next steps:")
+    print(f"  1. Write your post body in {source_md.name}")
+    print(f"  2. Add tags and fill out published_at when ready")
+    print(f"  3. Render:  python3 {SCRIPTS_DIR / 'render-post.py'} {source_md}")
+    print(f"  4. Build:   bash {SCRIPTS_DIR / 'build.sh'} {dirname}   # single-post; use --full for a full rebuild")
+    print(f"  5. Deploy:  node {SCRIPTS_DIR / 'deploy-website.mjs'} --only essays,posts/img,img,feeds,index.html")
+    print(f"  6. Cross-post: hydra-publish {dirname} --platforms nostr,substack,facebook,twitter-article")
+
+
+if __name__ == '__main__':
+    main()

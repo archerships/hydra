@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# lemmy-purge — Permanently remove posts or communities from local Lemmy instance.
+# Usage: lemmy-purge [post|community] ID [reason]
+
+LEMMY_URL="http://localhost:8080"
+ADMIN_USER="admin"
+ADMIN_PASS="admin_password"
+
+show_help() {
+    cat << 'EOF'
+lemmy-purge — Permanently remove Lemmy content
+
+USAGE:
+    lemmy-purge post ID [REASON]
+    lemmy-purge community ID [REASON]
+
+EXAMPLES:
+    lemmy-purge post 123 "Test data"
+    lemmy-purge community 5 "Redundant test community"
+EOF
+}
+
+if [[ $# -lt 2 ]]; then
+    show_help
+    exit 1
+fi
+
+TYPE=$1
+ID=$2
+REASON=${3:-"Cleanup"}
+
+# 1. Get JWT
+JWT=$(curl -s -X POST "${LEMMY_URL}/api/v3/user/login" \
+     -H "Content-Type: application/json" \
+     -d "{\"username_or_email\": \"${ADMIN_USER}\", \"password\": \"${ADMIN_PASS}\"}" | \
+     python3 -c "import sys, json; print(json.load(sys.stdin).get('jwt', 'ERROR'))")
+
+if [[ "$JWT" == "ERROR" ]]; then
+    echo "Error: Failed to authenticate with Lemmy." >&2
+    exit 1
+fi
+
+# 2. Execute Purge
+echo "INFO: Purging ${TYPE} ${ID}..."
+case $TYPE in
+    post)
+        ENDPOINT="${LEMMY_URL}/api/v3/admin/purge/post"
+        DATA="{\"post_id\": ${ID}, \"reason\": \"${REASON}\"}"
+        ;;
+    community)
+        ENDPOINT="${LEMMY_URL}/api/v3/admin/purge/community"
+        DATA="{\"community_id\": ${ID}, \"reason\": \"${REASON}\"}"
+        ;;
+    *)
+        echo "Error: Unknown type '${TYPE}'." >&2
+        exit 1
+        ;;
+esac
+
+RESULT=$(curl -s -X POST "$ENDPOINT" \
+     -H "Authorization: Bearer ${JWT}" \
+     -H "Content-Type: application/json" \
+     -d "$DATA")
+
+if echo "$RESULT" | grep -q '"success":true'; then
+    echo "SUCCESS: ${TYPE} ${ID} has been permanently purged."
+else
+    echo "FAILURE: Purge failed. Response: $RESULT"
+    exit 1
+fi

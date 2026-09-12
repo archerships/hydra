@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# substack-import -- Full historical sync of Substack content to local filesystem.
+#
+# Fetches every post and podcast from the configured Substack publication,
+# then sorts them into project-specific orbits under ~/av/prj/.
+#
+# Intended for first-time setup or full re-sync. For regular incremental
+# updates, use substack-sync instead.
+#
+# Usage: substack-import
+# Output: ~/av/doc/substack/
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHECKPOINT="${HOME}/av/doc/substack/.last-import"
+
+echo "[substack-import] Starting full historical fetch..."
+python3 "${SCRIPT_DIR}/substack-sync"
+
+echo "[substack-import] Sorting posts into project orbits..."
+python3 "${SCRIPT_DIR}/substack-sort.py"
+
+date -u +"%Y-%m-%dT%H:%M:%SZ" > "${CHECKPOINT}"
+echo "[substack-import] Done. Checkpoint written to ${CHECKPOINT}"

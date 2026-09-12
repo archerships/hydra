@@ -1,0 +1,1150 @@
+#!/Users/crasch/av/venv/hydra/bin/python3
+"""
+hydra-publish -- Cross-post an archerships.com post to multiple platforms.
+Posts may be essays, images, or videos (terminology directive 2026-08-13).
+
+archerships.com is the source of truth. This script adapts the cover image
+for each platform, calls the appropriate publisher script, and writes the
+result back to the essay's published_at frontmatter field.
+
+Usage:
+  hydra-publish <post-slug> --platforms twitter-article,facebook,substack,nostr
+  hydra-publish <post-slug> --all
+  hydra-publish <post-slug> --platforms twitter-article --image cover.jpg
+  hydra-publish <post-slug> --dry-run --all
+
+The essay slug is the directory name under ~/av/doc/posts/, e.g.:
+  2026-05-27-sovereign-x
+
+Available platforms:
+  twitter-article   Full essay as a Twitter Article
+  facebook          Short post with title, intro, and link
+  substack          Full essay as a Substack draft
+  nostr             Short announcement note (kind 1)
+
+Requirements:
+  pip install pyyaml beautifulsoup4 pillow
+
+After publishing, open the essay frontmatter and fill in the URL for each
+platform entry that was recorded with an empty url field.
+
+Chromium must be accessible (x-publisher.py auto-launches it with remote debugging):
+"""
+
+import argparse
+import hashlib
+import os
+import re
+import subprocess
+import sys
+from datetime import date
+from pathlib import Path
+
+import yaml
+from bs4 import BeautifulSoup
+
+sys.stdout.reconfigure(line_buffering=True)
+
+# Shared path config -- single source of truth (see hydra_paths.py).
+# If SCRIPTS_DIR moves, change it in hydra_paths.py only.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hydra_paths import SCRIPTS_DIR, CONTENT_DIR, DST_DIR, ARCHERSHIPS, BIN, TMP
+
+BASE_URL = 'https://archerships.com/essays'
+
+# Maps platform name -> hydra-adapt-image context
+IMAGE_CONTEXT = {
+    'twitter-article': 'twitter-article',
+    'facebook':        'facebook-landscape',
+    'substack':        'substack-cover',
+    'nostr':           'nostr-short',
+}
+
+# Platforms not requiring image adaptation (use essay's own images)
+NO_ADAPT_PLATFORMS = {'signal', 'odysee'}
+
+ALL_PLATFORMS = list(IMAGE_CONTEXT) + list(NO_ADAPT_PLATFORMS)
+
+
+# ---------------------------------------------------------------------------
+# Essay directory helpers
+# ---------------------------------------------------------------------------
+
+def essay_dir(slug: str) -> Path:
+    return CONTENT_DIR / slug
+
+
+def find_source_md(slug: str) -> Path:
+    """Return path to the source .md for slug (directory-based or flat fallback)."""
+    d = essay_dir(slug)
+    if d.is_dir():
+        # Current convention: SLUG/SLUG.md
+        canonical = d / f'{slug}.md'
+        if canonical.exists():
+            return canonical
+        # Legacy naming: SLUG/SLUG-source-v*.md
+        candidates = sorted(d.glob(f'{slug}-source-v*.md'), reverse=True)
+        if candidates:
+            return candidates[0]
+    # Flat layout fallback
+    return CONTENT_DIR / f'{slug}.md'
+
+
+def find_cover_image(slug: str) -> Path | None:
+    """Return the highest-versioned cover image in the essay directory, or None."""
+    d = essay_dir(slug)
+    if not d.is_dir():
+        return None
+    for ext in ('jpg', 'jpeg', 'png', 'webp'):
+        candidates = sorted(d.glob(f'{slug}-cover-v*.{ext}'), reverse=True)
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def next_asset_version(slug: str, platform: str) -> int:
+    """Return the next version number for a platform-specific asset in the essay dir."""
+    d = essay_dir(slug)
+    if not d.is_dir():
+        return 1
+    existing = []
+    for ext in ('jpg', 'jpeg', 'png', 'webp'):
+        existing.extend(d.glob(f'{slug}-{platform}-v*.{ext}'))
+    if not existing:
+        return 1
+    versions = [int(m.group(1)) for f in existing if (m := re.search(r'-v(\d+)-', f.name))]
+    return max(versions) + 1 if versions else 1
+
+
+def _latest_versioned(d: Path, slug: str, platform: str, fmt: str) -> Path | None:
+    """Return the highest-versioned asset file for (slug, platform, fmt), or None."""
+    candidates = list(d.glob(f'{slug}-{platform}-v*.{fmt}'))
+    if not candidates:
+        return None
+    def _vkey(p: Path) -> int:
+        m = re.search(r'-v(\d+)-', p.name)
+        return int(m.group(1)) if m else 0
+    return max(candidates, key=_vkey)
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter
+# ---------------------------------------------------------------------------
+
+def _split_frontmatter(text: str) -> tuple[str, str]:
+    """Return (fm_yaml, body). Raises ValueError if no frontmatter block."""
+    if not text.startswith('---'):
+        raise ValueError('No frontmatter block found')
+    parts = text.split('---', 2)
+    if len(parts) < 3:
+        raise ValueError('Incomplete frontmatter block')
+    return parts[1], parts[2]
+
+
+def read_frontmatter(slug: str) -> dict:
+    path = find_source_md(slug)
+    if not path.exists():
+        sys.exit(f'Essay not found: {path}')
+    try:
+        fm_yaml, _ = _split_frontmatter(path.read_text(encoding='utf-8'))
+        return yaml.safe_load(fm_yaml) or {}
+    except (ValueError, yaml.YAMLError) as exc:
+        sys.exit(f'Could not parse frontmatter: {exc}')
+
+
+def already_published(fm: dict, platform: str) -> bool:
+    return any(e.get('platform') == platform and e.get('url')
+               for e in (fm.get('published_at') or []))
+
+
+def record_published(slug: str, platform: str, url: str = '') -> None:
+    """Append a published_at entry. Rewrites frontmatter via yaml.dump."""
+    if platform == 'nostr' and not url:
+        print(f'  Skipping frontmatter update for {platform}: naddr URL is required '
+              f'(run nak encode naddr manually and add the entry).')
+        return
+    path = find_source_md(slug)
+    text = path.read_text(encoding='utf-8')
+    try:
+        fm_yaml, body = _split_frontmatter(text)
+    except ValueError:
+        print(f'  WARNING: could not update frontmatter for {slug}')
+        return
+    fm = yaml.safe_load(fm_yaml) or {}
+    pub_at = fm.get('published_at') or []
+    if not isinstance(pub_at, list):
+        pub_at = []
+    pub_at.append({'platform': platform, 'url': url, 'date': str(date.today())})
+    fm['published_at'] = pub_at
+    new_yaml = yaml.dump(fm, default_flow_style=False, allow_unicode=True)
+    path.write_text(f'---\n{new_yaml}---\n{body}', encoding='utf-8')
+    print(f'  Recorded in frontmatter: platform={platform} url={url or "(fill in manually)"}')
+
+
+# ---------------------------------------------------------------------------
+# Essay content
+# ---------------------------------------------------------------------------
+
+def get_dst_html(slug: str) -> Path:
+    path = DST_DIR / f'{slug}.html'
+    if not path.exists():
+        sys.exit(
+            f'Built essay not found: {path}\n'
+            f'Run: python3 {SCRIPTS_DIR}/build-essays.py'
+        )
+    return path
+
+
+def extract_intro(slug: str) -> tuple[str, str]:
+    """Return (title, first_paragraph) from the built essay HTML."""
+    soup = BeautifulSoup(get_dst_html(slug).read_text(encoding='utf-8'), 'html.parser')
+    h1 = soup.find('h1')
+    title = h1.get_text(strip=True) if h1 else slug
+    intro = ''
+    for el in (soup.find('main') or soup.find('body') or soup).find_all('p'):
+        text = el.get_text(' ', strip=True)
+        if text:
+            intro = text
+            break
+    return title, intro
+
+
+# ---------------------------------------------------------------------------
+# Image adaptation
+# ---------------------------------------------------------------------------
+
+def adapt_image(source: Path, context: str, slug: str, platform: str,
+                dry_run: bool) -> Path | None:
+    fmt = 'jpg' if context in ('facebook-landscape', 'substack-cover') else 'png'
+    if dry_run:
+        out = TMP / f'hydra-img-{context}.{fmt}'
+        cmd = [str(BIN / 'hydra-adapt-image'), str(source), context, '--out', str(out)]
+        print(f'  Adapting image for {context} -> {out.name}...')
+        print(f'  [dry-run] {" ".join(cmd)}')
+        return out
+
+    # Render to a temp path first so we can hash-compare before committing.
+    TMP.mkdir(parents=True, exist_ok=True)
+    tmp_out = TMP / f'hydra-img-{context}-tmp.{fmt}'
+    cmd = [str(BIN / 'hydra-adapt-image'), str(source), context, '--out', str(tmp_out)]
+    print(f'  Adapting image for {context}...')
+    # Strip PYTHONPATH: the caller (hydra-publish) may run on python3.14 with
+    # python3.11 site-packages injected for html2text, which breaks PIL's
+    # _imaging C extension inside hydra-adapt-image. It needs its own clean env.
+    adapt_env = {k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}
+    # timeout=300 per CODE.md 3.5 -- a hung adapt must not hang the publish.
+    result = subprocess.run(cmd, env=adapt_env, timeout=300)
+    if result.returncode != 0:
+        print(f'  WARNING: image adaptation failed for {context}')
+        return None
+
+    # Skip saving if the output is byte-for-byte identical to the latest existing version.
+    d = essay_dir(slug)
+    latest = _latest_versioned(d, slug, platform, fmt)
+    if latest:
+        new_hash  = hashlib.md5(tmp_out.read_bytes()).hexdigest()
+        prev_hash = hashlib.md5(latest.read_bytes()).hexdigest()
+        if new_hash == prev_hash:
+            tmp_out.unlink()
+            print(f'  Image unchanged -- reusing {latest.name}')
+            return latest
+
+    d.mkdir(parents=True, exist_ok=True)
+    version  = next_asset_version(slug, platform)
+    date_str = str(date.today())
+    out = d / f'{slug}-{platform}-v{version}-{date_str}.{fmt}'
+    tmp_out.rename(out)
+    print(f'  Saved: {out.name}')
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Platform calls
+# ---------------------------------------------------------------------------
+
+def _run(cmd: list[str], dry_run: bool, label: str) -> bool:
+    print(f'  Running {label}...')
+    print(f'  $ {" ".join(cmd)}')
+    if dry_run:
+        print('  [dry-run] skipped.')
+        return True
+    # 600s: CDP publishers drive a real browser and x-publisher waits for
+    # the operator's manual paste approval -- 300 would kill a slow but
+    # legitimate interactive publish. (Plan B3 decision: 300s for batch
+    # launchers, 600s for interactive browser drivers.)
+    try:
+        result = subprocess.run(cmd, timeout=600)
+    except subprocess.TimeoutExpired:
+        print(f'  FAILED: {label} timed out after 600s.')
+        return False
+    return result.returncode == 0
+
+
+def pub_twitter_article(slug: str, image: Path | None, dry_run: bool) -> bool:
+    # Spawn with sys.executable (the hydra venv python): x-publisher uses
+    # PEP 604 annotations and crashes under /usr/bin/python3 3.9.
+    cmd = [sys.executable, str(BIN / 'x-publisher.py'), str(get_dst_html(slug))]
+    if image and image.exists():
+        cmd += ['--image', str(image)]
+    return _run(cmd, dry_run, 'x-publisher')
+
+
+def pub_facebook(slug: str, fm: dict, dry_run: bool) -> bool:
+    """Publish to Facebook using the pfp plaintext pipeline (the guideline).
+
+    The FB post body is the plaintext reflow of the essay source markdown
+    (via pfp.render_body): URLs stripped, markdown emphasis removed, list
+    markers KEPT, one blank line between paragraphs, footnote definitions
+    moved to the comment. The essay URL + contact block go in a comment
+    (Facebook downranks linked posts).
+    """
+    # Reuse pfp's canonical plaintext pipeline (single source of truth).
+    # pfp is extension-less (~/av/bin/pfp), so spec_from_file_location
+    # returns None -- load via exec into a fresh module.
+    import types
+
+    pfp_path = Path.home() / "av" / "bin" / "pfp"
+    pfp = types.ModuleType("pfp_module")
+    exec(compile(pfp_path.read_text(encoding="utf-8"), "pfp", "exec"), pfp.__dict__)
+
+    md_path = find_source_md(slug)
+    if not md_path.exists():
+        print(f"  [WARN] source md not found: {md_path}; falling back to HTML text")
+        soup = BeautifulSoup(get_dst_html(slug).read_text(encoding='utf-8'), 'html.parser')
+        main_el = soup.find('main') or soup.find('body') or soup
+        for el in main_el.find_all(id=['site-breadcrumb', 'site-nav', 'site-footer',
+                                       'also-published', 'contact-snippet']):
+            el.decompose()
+        for el in main_el.find_all(class_='also-published'):
+            el.decompose()
+        full_text = main_el.get_text('\n', strip=True)
+        body = re.sub(r'\n{3,}', '\n\n', full_text).strip()
+    else:
+        raw = md_path.read_text(encoding='utf-8')
+        body = pfp.strip_frontmatter(raw)
+        body = pfp.render_body(body)
+
+    if not body:
+        body = fm.get('title', slug)
+    # Body must NOT contain the essay URL (Facebook downranks linked posts).
+    # fb-publisher builds the comment from --essay-url + contact file instead.
+    url = f'{BASE_URL}/{slug}.html'
+    TMP.mkdir(parents=True, exist_ok=True)
+    text_file = TMP / f'hydra-fb-{slug}.txt'
+    if not dry_run:
+        text_file.write_text(body, encoding='utf-8')
+    cmd = [sys.executable, str(BIN / 'fb-publisher.py'), str(text_file), '--essay-url', url,
+           '--essay-dir', str(essay_dir(slug))]
+    return _run(cmd, dry_run, 'fb-publisher')
+
+
+def pub_substack(slug: str, image: Path | None, dry_run: bool) -> bool:
+    """Publish to Substack via the API publisher (python-substack library).
+
+    Requires python-substack (pip install python-substack) and a valid
+    ~/.config/substack/cookies.json session.
+    """
+    cmd = ['/opt/homebrew/bin/python3.11', str(BIN / 'substack-api-publisher.py'),
+           '--essay', str(essay_dir(slug) / f'{slug}.md')]
+    if image and image.exists():
+        cmd += ['--cover', str(image)]
+    return _run(cmd, dry_run, 'substack-api-publisher')
+
+
+def load_nostr_snippet() -> str:
+    path = ARCHERSHIPS / 'src' / 'essays' / 'contact-snippet.txt'
+    if path.exists():
+        return path.read_text(encoding='utf-8').strip()
+    return ''
+
+
+def essay_to_markdown(slug: str, image_url: str | None = None) -> str:
+    """Convert the built essay HTML to markdown for Nostr kind 30023.
+
+    Relative image srcs are rewritten to absolute URLs so Nostr clients can
+    load them. The primary (hero) image favors the permanent Arweave URL
+    (image_url, e.g. https://arweave.net/{txId}) passed from pub_nostr; the
+    archerships.com essay URL is only a fallback for non-uploaded images.
+    """
+    from urllib.parse import urljoin
+    import html2text
+    soup = BeautifulSoup(get_dst_html(slug).read_text(encoding='utf-8'), 'html.parser')
+    main_el = soup.find('main') or soup.find('body') or soup
+    # Strip nav/footer/contact-snippet elements
+    for el in main_el.find_all(id=['site-breadcrumb', 'site-nav', 'site-footer',
+                                   'also-published', 'contact-snippet']):
+        el.decompose()
+    for el in main_el.find_all(class_='also-published'):
+        el.decompose()
+    # Rewrite relative image src to absolute URLs so Nostr clients can load them
+    essay_url = f'{BASE_URL}/{slug}.html'
+    hero_img = main_el.find('img')
+    for img in main_el.find_all('img'):
+        src = img.get('src', '')
+        if src and not src.startswith(('http://', 'https://', 'data:')):
+            if img is hero_img and image_url:
+                # Hero is promoted to the cover via the Nostr image tag
+                # (rendered once by clients); drop it from the body so it
+                # does not appear twice. Fixed 2026-08-13.
+                parent = img.parent
+                if parent and parent.name == 'a' and parent.find_all('img') == [img]:
+                    parent.decompose()
+                else:
+                    img.decompose()
+            else:
+                img['src'] = urljoin(essay_url, src)
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.ignore_images = False
+    h.body_width = 0
+    return h.handle(str(main_el)).strip()
+
+
+def upload_to_arweave(image_path: Path, dry_run: bool) -> str | None:
+    script = SCRIPTS_DIR / 'arweave-upload.mjs'
+    if dry_run:
+        print(f'  [dry-run] would upload {image_path.name} to Arweave')
+        return 'https://arweave.net/DRY_RUN_PLACEHOLDER'
+    print(f'  Uploading {image_path.name} to Arweave...')
+    result = subprocess.run(
+        ['node', str(script), str(image_path)],
+        capture_output=True, text=True, cwd=str(ARCHERSHIPS), timeout=300,
+    )
+    if result.returncode != 0:
+        print(f'  WARNING: Arweave upload failed: {result.stderr.strip()}')
+        return None
+    url = result.stdout.strip()
+    print(f'  Arweave image URL: {url}')
+    return url
+
+
+def pub_nostr(slug: str, fm: dict, adapted_image: Path | None,
+              image_url: str | None, dry_run: bool) -> tuple[bool, str]:
+    title = fm.get('title', slug)
+    url = f'{BASE_URL}/{slug}.html'
+    snippet = load_nostr_snippet()
+    tags_raw = fm.get('tags') or []
+    tags_str = ','.join(str(t).strip('"') for t in tags_raw) if tags_raw else ''
+
+    _, summary = extract_intro(slug)
+
+    # Auto-upload adapted image to Arweave if no URL already supplied.
+    # Favor the permanent https://arweave.net/{txId} URL for the hero image
+    # so Nostr clients can render it without depending on archerships.com.
+    if not image_url and adapted_image and adapted_image.exists():
+        image_url = upload_to_arweave(adapted_image, dry_run)
+
+    # Write full markdown body to a temp file (avoids shell quoting issues)
+    markdown = essay_to_markdown(slug, image_url=image_url)
+    if snippet:
+        markdown = f'{markdown}\n\n---\n\n{snippet}'
+    TMP.mkdir(parents=True, exist_ok=True)
+    md_file = TMP / f'hydra-nostr-{slug}.md'
+    if not dry_run:
+        md_file.write_text(markdown, encoding='utf-8')
+
+    cmd = [sys.executable, str(BIN / 'nostr-publisher.py'),
+           '--kind', '30023',
+           '--file', str(md_file),
+           '--title', title,
+           '--slug', slug,
+           '--url', url]
+    if summary:
+        cmd += ['--summary', summary]
+    if tags_str:
+        cmd += ['--tags', tags_str]
+    if image_url:
+        cmd += ['--image-url', image_url]
+    if dry_run:
+        cmd += ['--dry-run']
+        print(f'  Running nostr-publisher...')
+        print(f'  $ {" ".join(cmd)}')
+        print('  [dry-run] skipped.')
+        return True, ''
+
+    print(f'  Running nostr-publisher...')
+    print(f'  $ {" ".join(cmd)}')
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        print('  FAILED: nostr-publisher timed out after 600s.')
+        return False, ''
+    sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    nostr_url = ''
+    for line in result.stdout.splitlines():
+        if line.startswith('NOSTR_URL='):
+            nostr_url = line[len('NOSTR_URL='):]
+    return result.returncode == 0, nostr_url
+
+
+def pub_signal(slug: str, dry_run: bool, arweave: bool = False,
+               pdf: bool = False, epub: bool = False) -> bool:
+    """Publish to Signal groups (default = sfa: full + announce).
+
+    Delegates to hydra-signal --both SLUG, which sends the full post
+    (text + hero + inline images) to the SIGNALFULL group list and an
+    announcement (title, first paragraph, post URL, contact page link,
+    hero image) to the SIGNALANNOUNCE list.
+    """
+    script = BIN / 'hydra-signal'
+    cmd = [str(script), '--both', slug]
+    if arweave:
+        cmd += ['--arweave']
+    if pdf:
+        cmd += ['--pdf']
+    elif epub:
+        cmd += ['--epub']   # explicit EPUB (same as hydra-signal default)
+    if dry_run:
+        cmd += ['--dry-run']
+    print(f'  Running hydra-signal (sfa)...')
+    print(f'  $ {" ".join(cmd)}')
+    if dry_run:
+        return True
+    try:
+        # 600s: signal sends include media attachment uploads.
+        result = subprocess.run(cmd, timeout=600)
+    except subprocess.TimeoutExpired:
+        print('  FAILED: hydra-signal timed out after 600s.')
+        return False
+    return result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Odysee (video/article platform via the first-party API plugin)
+# ---------------------------------------------------------------------------
+
+def pub_odysee(slug: str, fm: dict, args, adapted: Path | None) -> tuple[bool, str]:
+    """Publish to Odysee via the hydra_crud plugin (first-party TUS upload).
+
+    Delegates to OdyseePlugin.create with the same ctx dict the CRUD verbs
+    build, so the plugin's keyring auth (service 'odysee') and its TUS
+    upload flow are the single implementation (see
+    hydra_crud/plugins/odysee.py).
+    """
+    model, registry = _crud_imports()
+    plugin = registry.get('odysee')
+
+    # odysee channel claim id from keyring (plugin resolves); post type:
+    # video when the essay dir has a video file, else article.
+    ctx = _build_ctx(args, slug)
+    post_dict = _load_post_from_repo(args, slug)
+    post_dict['post_type'] = 'video'
+    # Explicit --image becomes the claim thumbnail (plugin uploads it to
+    # Arweave); without it the plugin extracts a video frame.
+    if getattr(args, 'image', None):
+        post_dict['cover_image'] = str(Path(args.image).expanduser().resolve())
+    post = model.Post(**post_dict)
+
+    try:
+        ref = plugin.create(post, ctx)
+    except Exception as exc:
+        print(f'  FAILED: {exc}')
+        return False, ''
+    print(f'  odysee: {ref.url or ref.post_id}')
+    return True, ref.url or ''
+
+
+# ---------------------------------------------------------------------------
+# Build and deploy
+# ---------------------------------------------------------------------------
+
+def build_and_deploy(dry_run: bool) -> None:
+    build_cmd  = ['python3', str(SCRIPTS_DIR / 'build-essays.py')]
+    deploy_cmd = ['node', str(SCRIPTS_DIR / 'deploy-website.mjs'),
+                  '--only', 'essays,posts/img', '--yes']
+    print('Rebuilding essays...')
+    _run(build_cmd, dry_run, 'build-essays')
+    print('Deploying...')
+    _run(deploy_cmd, dry_run, 'deploy-website')
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Cross-post an archerships.com essay to multiple platforms.'
+    )
+    sub = parser.add_subparsers(dest='command', metavar='COMMAND')
+
+    # ── create (legacy default behavior) ────────────────────────────────
+    p_create = sub.add_parser('create', help='Publish a new post to platforms')
+    p_create.add_argument('slug', help='Essay slug (stem of ~/av/doc/posts/SLUG/SLUG.md)')
+    _add_platform_args(p_create)
+    _add_crud_common(p_create)
+    p_create.set_defaults(func=cmd_create)
+
+    # ── read ────────────────────────────────────────────────────────────
+    p_read = sub.add_parser('read', help='Check post status on platforms')
+    p_read.add_argument('slug', help='Essay slug')
+    _add_platform_args(p_read)
+    _add_crud_common(p_read)
+    p_read.set_defaults(func=cmd_read)
+
+    # ── update ──────────────────────────────────────────────────────────
+    p_update = sub.add_parser('update', help='Update existing posts on platforms')
+    p_update.add_argument('slug', help='Essay slug')
+    _add_platform_args(p_update)
+    _add_crud_common(p_update)
+    p_update.set_defaults(func=cmd_update)
+
+    # ── delete ──────────────────────────────────────────────────────────
+    p_delete = sub.add_parser('delete', help='Delete posts from platforms (irreversible)')
+    p_delete.add_argument('slug', help='Essay slug')
+    _add_platform_args(p_delete)
+    _add_crud_common(p_delete)
+    p_delete.add_argument('--yes', action='store_true',
+                          help='Skip per-platform confirmation prompts')
+    p_delete.set_defaults(func=cmd_delete)
+
+    # ── list ────────────────────────────────────────────────────────────
+    p_list = sub.add_parser('list', help='List posts on a platform')
+    p_list.add_argument('--platform', required=True,
+                        help=f'Platform to list (e.g. facebook)')
+    _add_crud_common(p_list)
+    p_list.set_defaults(func=cmd_list)
+
+    # ── sync ─────────────────────────────────────────────────────────────
+    p_sync = sub.add_parser('sync',
+                            help='Sync a post from SRC to one or more DST platforms (upsert)')
+    p_sync.add_argument('slug', help='Essay slug')
+    _add_crud_common(p_sync)
+    p_sync.add_argument('--from', dest='src', default='repo',
+                        help='Source platform (default: repo -- the md+images source of truth)')
+    p_sync.add_argument('--to', dest='dst', required=True,
+                        help='Comma-separated destination platforms')
+    p_sync.set_defaults(func=cmd_sync)
+
+    # ── propagate ───────────────────────────────────────────────────────
+    p_prop = sub.add_parser('propagate',
+                            help='Update every platform with a ref; create for the rest')
+    p_prop.add_argument('slug', help='Essay slug')
+    _add_crud_common(p_prop)
+    p_prop.add_argument('--include-new', action='store_true',
+                        help='Also create posts on platforms without a ref')
+    p_prop.set_defaults(func=cmd_propagate)
+
+    args = parser.parse_args()
+
+    if not getattr(args, 'command', None):
+        parser.print_help()
+        sys.exit(1)
+
+    args.func(args)
+
+
+def _add_platform_args(p) -> None:
+    group = p.add_mutually_exclusive_group()
+    group.add_argument('--platforms', '-p',
+                       help=f'Comma-separated: {",".join(ALL_PLATFORMS)}')
+    group.add_argument('--all', action='store_true',
+                       help='All platforms')
+
+
+def _add_crud_common(p) -> None:
+    p.add_argument('--image', '-i',
+                   help='Source cover image (local path); adapted per platform')
+    p.add_argument('--image-url',
+                   help='HTTPS URL of cover image already hosted (for Nostr)')
+    p.add_argument('--account',
+                   help='Account name (keyring entry or platform username)')
+    p.add_argument('--destination',
+                   help='Destination: profile | page | group | subreddit')
+    p.add_argument('--post-type',
+                   choices=['tweet', 'note', 'shortnote', 'article', 'longnote',
+                            'list', 'image', 'video'],
+                   help='Type of post to publish (default: article)')
+    p.add_argument('--arweave', action='store_true',
+                   help='Source attached media (e.g. Signal images) from Arweave')
+    p.add_argument('--pdf', action='store_true',
+                   help='Signal: send the essay as ONE PDF/A-2b document (default is EPUB)')
+    p.add_argument('--epub', action='store_true',
+                   help='Signal: send the essay as one EPUB3 document (the default)')
+    p.add_argument('--visibility', choices=['public', 'unlisted', 'scheduled'],
+                   help='Odysee: claim visibility (default: unlisted, encoded as '
+                        'release_time; unlisted hides from feeds, scheduled needs '
+                        '--release-time)')
+    p.add_argument('--tags', help='Odysee: comma-separated tags (overrides frontmatter tags)')
+    p.add_argument('--description', help='Odysee: description override (defaults to post body)')
+    p.add_argument('--release-time', type=int,
+                   help='Odysee: release time as unix timestamp (with --visibility scheduled '
+                        'or to backdate a public release)')
+    p.add_argument('--license', help='Odysee: license name (e.g. "Public Domain", "None", '
+                                     '"Copyrighted", or custom text)')
+    p.add_argument('--license-url', help='Odysee: license URL (optional, alongside --license)')
+    p.add_argument('--dry-run', action='store_true',
+                   help='Show what would run without publishing or modifying files')
+
+
+def _resolve_platforms(args) -> list[str]:
+    if getattr(args, 'all', False):
+        return ALL_PLATFORMS[:]
+    if getattr(args, 'platforms', None):
+        platforms = [x.strip() for x in args.platforms.split(',')]
+        unknown = [x for x in platforms if x not in ALL_PLATFORMS]
+        if unknown:
+            sys.exit(f'Unknown platform(s): {", ".join(unknown)}\n'
+                     f'Valid: {", ".join(ALL_PLATFORMS)}')
+        return platforms
+    return []
+
+
+def _normalize_post_type(raw: str | None) -> str:
+    if raw in ('note', 'shortnote', 'longnote'):
+        return 'article' if raw == 'longnote' else 'tweet'
+    return raw or 'article'
+
+
+def _build_ctx(args, slug: str) -> dict:
+    ctx = {
+        'tmp_dir': str(TMP),
+        'essay_dir': str(essay_dir(slug)),
+        'dry_run': args.dry_run,
+        'account': args.account or 'archerships',
+        'destination': args.destination or 'profile',
+        'yes': getattr(args, 'yes', False),
+    }
+    # Odysee extended publish options (passed through to the plugin's
+    # _claim_params; harmless for other platforms, which ignore them).
+    for opt, key in [('visibility', 'odysee_visibility'),
+                     ('tags', 'odysee_tags'),
+                     ('description', 'odysee_description'),
+                     ('release_time', 'odysee_release_time'),
+                     ('license', 'odysee_license'),
+                     ('license_url', 'odysee_license_url')]:
+        val = getattr(args, opt, None)
+        if val is not None:
+            ctx[key] = val
+    contact = ARCHERSHIPS / 'prj' / 'hydra' / 'publish' / 'config' / 'fb-contact.txt'
+    ctx['contact_file'] = str(contact if contact.exists()
+                              else Path.home() / 'av' / 'prj' / 'hydra' / 'publish' / 'config' / 'fb-contact.txt')
+    return ctx
+
+
+def _load_post(args, slug: str) -> dict:
+    """Build the normalized Post dict from the essay source."""
+    fm = read_frontmatter(slug)
+    title, intro = extract_intro(slug)
+    return {
+        'title': fm.get('title', title or slug),
+        'body': intro,
+        'cover_image': str(args.image) if args.image else '',
+        'tags': fm.get('tags') or [],
+        'url': f'{BASE_URL}/{slug}.html',
+        'slug': slug,
+        'post_type': _normalize_post_type(args.post_type),
+    }
+
+
+def _load_post_from_repo(args, slug: str) -> dict:
+    """Build the normalized Post dict from the REPO source of truth.
+
+    Reads SLUG/SLUG.md directly (frontmatter + body markdown), not the
+    built HTML -- per D10, the markdown + images in ~/av/doc/posts/ are
+    authoritative. The body is the raw markdown; platforms that need
+    plain text strip markup themselves (facebook) or get full markdown
+    (nostr/substack).
+    """
+    md_path = find_source_md(slug)
+    if not md_path.exists():
+        sys.exit(f'Essay not found in repo: {md_path}')
+
+    text = md_path.read_text(encoding='utf-8')
+    try:
+        fm_yaml, body = _split_frontmatter(text)
+        fm = yaml.safe_load(fm_yaml) or {}
+    except (ValueError, yaml.YAMLError) as exc:
+        sys.exit(f'Could not parse frontmatter for {slug}: {exc}')
+
+    # Cover image: explicit hero_image frontmatter wins, else the first
+    # image referenced in the body, else the highest-versioned cover file.
+    cover = str(args.image) if args.image else ''
+    if not cover:
+        hero = fm.get('hero_image')
+        if hero:
+            candidate = essay_dir(slug) / str(hero)
+            if candidate.exists():
+                cover = str(candidate)
+    if not cover:
+        cover_img = find_cover_image(slug)
+        if cover_img:
+            cover = str(cover_img)
+
+    return {
+        'title': fm.get('title', slug),
+        'body': body.strip(),
+        'cover_image': cover,
+        'tags': fm.get('tags') or [],
+        'url': f'{BASE_URL}/{slug}.html',
+        'slug': slug,
+        'post_type': _normalize_post_type(args.post_type),
+        'updated_at': fm.get('date', ''),
+    }
+
+
+def _crud_imports():
+    """Import hydra_crud lazily so legacy create paths still work without it."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from hydra_crud import model, registry
+    return model, registry
+
+
+def _md_for_slug(slug: str) -> Path:
+    return find_source_md(slug)
+
+
+def cmd_create(args) -> None:
+    slug = args.slug
+    fm = read_frontmatter(slug)
+    print(f'Essay  : {slug}')
+    print(f'Title  : {fm.get("title", slug)}')
+    platforms = _resolve_platforms(args)
+    if args.dry_run:
+        print('[DRY RUN -- no files modified, no posts sent]')
+    print()
+
+    if not platforms:
+        # Legacy: require --platforms/--all (matches old behavior)
+        sys.exit('create requires --platforms or --all')
+
+    source_image = Path(os.path.expanduser(args.image)) if args.image else None
+    if source_image is None:
+        source_image = find_cover_image(slug)
+        if source_image:
+            print(f'Cover image: {source_image.name}')
+
+    results: dict[str, str] = {}
+
+    for platform in platforms:
+        print(f'=== {platform} ===')
+        if already_published(fm, platform):
+            print('  Already in published_at; skipping.')
+            print('  To re-publish, remove the entry from the frontmatter first.')
+            results[platform] = 'skipped'
+            print()
+            continue
+
+        adapted = None
+        if platform not in NO_ADAPT_PLATFORMS and platform in IMAGE_CONTEXT:
+            adapted = adapt_image(source_image, IMAGE_CONTEXT[platform],
+                                  slug, platform, args.dry_run) if source_image else None
+
+        ok = False
+        pub_url = ''
+        if platform == 'twitter-article':
+            ok = pub_twitter_article(slug, adapted, args.dry_run)
+        elif platform == 'facebook':
+            ok = pub_facebook(slug, fm, args.dry_run)
+        elif platform == 'substack':
+            ok = pub_substack(slug, adapted, args.dry_run)
+            if ok and not args.dry_run:
+                url_script = BIN / 'substack-post-url.py'
+                if url_script.exists():
+                    print('  Fetching Substack URL ...')
+                    try:
+                        r = subprocess.run([sys.executable, str(url_script), slug],
+                                           capture_output=True, text=True, timeout=300)
+                    except subprocess.TimeoutExpired:
+                        r = None
+                        print('  WARNING: substack URL fetch timed out.')
+                    if r is not None:
+                        print(r.stdout.strip())
+        elif platform == 'nostr':
+            ok, pub_url = pub_nostr(slug, fm, adapted, args.image_url, args.dry_run)
+        elif platform == 'signal':
+            ok = pub_signal(slug, args.dry_run, args.arweave, args.pdf, args.epub)
+        elif platform == 'odysee':
+            ok, pub_url = pub_odysee(slug, fm, args, adapted)
+
+        if ok:
+            results[platform] = 'ok'
+            if not args.dry_run:
+                record_published(slug, platform, pub_url)
+        else:
+            results[platform] = 'failed'
+            print(f'  FAILED.')
+        print()
+
+    published = [p for p, r in results.items() if r == 'ok']
+    print('=== Summary ===')
+    for platform, result in results.items():
+        print(f'  {platform:20s} {result}')
+    if published and not args.dry_run:
+        print(f'\nFill in published URLs in: {_md_for_slug(slug)}')
+
+
+def _crud_platforms(args) -> list[str]:
+    """Platforms for CRUD verbs: explicit list, or infer from frontmatter refs."""
+    explicit = _resolve_platforms(args)
+    if explicit:
+        return explicit
+    return []
+
+
+def cmd_read(args) -> None:
+    model, registry = _crud_imports()
+    slug = args.slug
+    platforms = _crud_platforms(args)
+    md = _md_for_slug(slug)
+    ctx = _build_ctx(args, slug)
+
+    from essay_frontmatter import get_platform_ref
+
+    if not platforms:
+        fm = read_frontmatter(slug)
+        platforms = [e.get('platform') for e in (fm.get('published_at') or [])]
+
+    print(f'Reading status for {slug} on: {", ".join(platforms) or "(none recorded)"}')
+    for platform in platforms:
+        print(f'=== {platform} ===')
+        try:
+            plugin = registry.get(platform)
+        except Exception as e:
+            print(f'  No plugin: {e}')
+            continue
+        ref_dict = get_platform_ref(md, platform)
+        if not ref_dict:
+            print('  No published_at entry for this platform.')
+            continue
+        ref = model.PlatformRef.from_dict({**ref_dict, 'platform': platform})
+        status = plugin.read(ref, ctx)
+        print(f'  exists: {status.exists}')
+        print(f'  url:    {status.url or "-"}')
+        print(f'  id:     {status.post_id or "-"}')
+        if status.note:
+            print(f'  note:   {status.note}')
+
+
+def cmd_update(args) -> None:
+    model, registry = _crud_imports()
+    slug = args.slug
+    platforms = _crud_platforms(args)
+    md = _md_for_slug(slug)
+    ctx = _build_ctx(args, slug)
+    post_dict = _load_post(args, slug)
+    post = model.Post(**post_dict)
+
+    from essay_frontmatter import get_platform_ref
+
+    if not platforms:
+        fm = read_frontmatter(slug)
+        platforms = [e.get('platform') for e in (fm.get('published_at') or [])]
+
+    print(f'Updating {slug} on: {", ".join(platforms) or "(none recorded)"}')
+    for platform in platforms:
+        print(f'=== {platform} ===')
+        try:
+            plugin = registry.get(platform)
+        except Exception as e:
+            print(f'  No plugin: {e}')
+            continue
+        ref_dict = get_platform_ref(md, platform)
+        if not ref_dict:
+            print('  No published_at entry -- use create instead.')
+            continue
+        ref = model.PlatformRef.from_dict({**ref_dict, 'platform': platform})
+        try:
+            new_ref = plugin.update(ref, post, ctx)
+            if not args.dry_run:
+                from essay_frontmatter import set_platform_ref
+                set_platform_ref(md, platform, new_ref.to_dict())
+            print(f'  updated: {new_ref.url or new_ref.post_id}')
+        except Exception as e:
+            print(f'  FAILED: {e}')
+
+
+def cmd_delete(args) -> None:
+    model, registry = _crud_imports()
+    slug = args.slug
+    platforms = _crud_platforms(args)
+    md = _md_for_slug(slug)
+    ctx = _build_ctx(args, slug)
+
+    from essay_frontmatter import get_platform_ref, remove_platform_entry
+
+    if not platforms:
+        fm = read_frontmatter(slug)
+        platforms = [e.get('platform') for e in (fm.get('published_at') or [])]
+
+    print(f'Deleting {slug} from: {", ".join(platforms) or "(none recorded)"}')
+    for platform in platforms:
+        print(f'=== {platform} ===')
+        try:
+            plugin = registry.get(platform)
+        except Exception as e:
+            print(f'  No plugin: {e}')
+            continue
+        ref_dict = get_platform_ref(md, platform)
+        if not ref_dict:
+            print('  No published_at entry for this platform.')
+            continue
+        ref = model.PlatformRef.from_dict({**ref_dict, 'platform': platform})
+        try:
+            plugin.delete(ref, ctx)
+            if not args.dry_run:
+                remove_platform_entry(md, platform)
+            print(f'  deleted: {ref.url or ref.post_id}')
+        except Exception as e:
+            print(f'  FAILED: {e}')
+
+
+def cmd_list(args) -> None:
+    model, registry = _crud_imports()
+    ctx = _build_ctx(args, '')
+    try:
+        plugin = registry.get(args.platform)
+    except Exception as e:
+        sys.exit(f'No plugin: {e}')
+    print(f'Listing posts on {args.platform}...')
+    try:
+        refs = plugin.list(ctx)
+        for ref in refs:
+            print(f'  {ref.post_id or "-":>12}  {ref.url or "-"}  {ref.post_type}')
+        if not refs:
+            print('  (none)')
+    except NotImplementedError as e:
+        print(f'  Not supported by this plugin: {e}')
+
+
+def cmd_sync(args) -> None:
+    """Sync a post from SRC to one or more DST platforms (D9 upsert)."""
+    model, registry = _crud_imports()
+    slug = args.slug
+    md = _md_for_slug(slug)
+    ctx = _build_ctx(args, slug)
+
+    from essay_frontmatter import get_platform_ref, set_platform_ref
+
+    src = args.src
+    dsts = [d.strip() for d in args.dst.split(',') if d.strip()]
+    if not dsts:
+        sys.exit('sync requires --to (comma-separated destinations)')
+
+    # Resolve the source Post.
+    if src in ('repo', 'website'):
+        if src == 'repo':
+            # Source of truth = the .md + images in ~/av/doc/posts/SLUG/
+            post_dict = _load_post_from_repo(args, slug)
+        else:
+            # Explicit website source = the built HTML (debug/deploy checks)
+            post_dict = _load_post(args, slug)
+        post = model.Post(**post_dict)
+        print(f'Source : {src} ({slug})')
+    else:
+        try:
+            src_plugin = registry.get(src)
+        except Exception as e:
+            sys.exit(f'No plugin for source platform "{src}": {e}')
+        # Reverse flow: fetch the Post from the SRC platform.
+        src_ref_dict = get_platform_ref(md, src)
+        if not src_ref_dict:
+            sys.exit(f'No published_at entry for source platform "{src}" '
+                     f'-- cannot fetch the post to sync from.')
+        src_ref = model.PlatformRef.from_dict({**src_ref_dict, 'platform': src})
+        fetched = getattr(src_plugin, 'fetch_post', None)
+        if fetched is None:
+            sys.exit(f'Plugin "{src}" does not support fetch_post (needed for --from {src}).')
+        try:
+            post = fetched(src_ref, ctx)
+        except NotImplementedError as e:
+            sys.exit(f'--from {src} not available yet: {e}')
+        print(f'Source : {src} ({src_ref.url or src_ref.post_id})')
+
+    print(f'Targets: {", ".join(dsts)}')
+    if args.dry_run:
+        print('[DRY RUN -- no posts sent, no files modified]')
+    print()
+
+    for dst in dsts:
+        print(f'=== {dst} ===')
+        try:
+            plugin = registry.get(dst)
+        except Exception as e:
+            print(f'  No plugin: {e}')
+            continue
+
+        ref_dict = get_platform_ref(md, dst)
+        try:
+            if ref_dict:
+                ref = model.PlatformRef.from_dict({**ref_dict, 'platform': dst})
+
+                # Conflict rule (D9): never clobber a newer DST post.
+                src_date = getattr(post, 'updated_at', '') or ''
+                dst_date = ref.updated_at or ''
+                if src_date and dst_date and src_date < dst_date:
+                    print(f'  SKIP: SRC ({src_date}) older than DST ref ({dst_date}).')
+                    continue
+
+                new_ref = plugin.update(ref, post, ctx)
+                action = 'updated'
+            else:
+                new_ref = plugin.create(post, ctx)
+                action = 'created'
+            if not args.dry_run:
+                set_platform_ref(md, dst, new_ref.to_dict())
+            print(f'  {action}: {new_ref.url or new_ref.post_id}')
+        except NotImplementedError as e:
+            print(f'  SKIP: {e}')
+        except Exception as e:
+            print(f'  FAILED: {e}')
+
+
+def cmd_propagate(args) -> None:
+    model, registry = _crud_imports()
+    slug = args.slug
+    md = _md_for_slug(slug)
+    ctx = _build_ctx(args, slug)
+    post_dict = _load_post(args, slug)
+    post = model.Post(**post_dict)
+
+    from essay_frontmatter import get_platform_ref, set_platform_ref
+
+    fm = read_frontmatter(slug)
+    platforms = [e.get('platform') for e in (fm.get('published_at') or [])]
+
+    print(f'Propagating {slug} to {len(platforms)} platform(s) with refs...')
+    for platform in platforms:
+        print(f'=== {platform} ===')
+        try:
+            plugin = registry.get(platform)
+        except Exception as e:
+            print(f'  No plugin: {e}')
+            continue
+        ref_dict = get_platform_ref(md, platform)
+        if not ref_dict:
+            continue
+        ref = model.PlatformRef.from_dict({**ref_dict, 'platform': platform})
+        try:
+            new_ref = plugin.update(ref, post, ctx)
+            if not args.dry_run:
+                set_platform_ref(md, platform, new_ref.to_dict())
+            print(f'  updated: {new_ref.url or new_ref.post_id}')
+        except NotImplementedError:
+            print('  Plugin has no update; skipped.')
+        except Exception as e:
+            print(f'  FAILED: {e}')
+
+    if args.include_new:
+        print('=== creating on platforms without refs ===')
+        for platform in ALL_PLATFORMS:
+            if platform in platforms:
+                continue
+            print(f'=== {platform} ===')
+            try:
+                plugin = registry.get(platform)
+            except Exception:
+                continue
+            try:
+                new_ref = plugin.create(post, ctx)
+                if not args.dry_run:
+                    set_platform_ref(md, platform, new_ref.to_dict())
+                print(f'  created: {new_ref.url}')
+            except Exception as e:
+                print(f'  FAILED: {e}')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,10 @@
+# Real credentials belong in the keyring / env, never here.
+ingest/service/matterbridge.toml
+ingest/data/
+ingest/service/data/
+.env
+.env.*
+__pycache__/
+*.pyc
+log/
+*.log

@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# hydra-signal -- Send Signal messages to groups via signal-cli.
+# Part of the Hydra multi-platform social publishing toolkit.
+#
+# Modes (essay-based, default: --both):
+#   --full SLUG      Send the FULL post text + hero image + inline images
+#                    to the SIGNALFULL group list.
+#   --announce SLUG  Send an announcement (title, first paragraph, post
+#                    URL, contact page link, hero image) to the
+#                    SIGNALANNOUNCE list.
+#   --both SLUG      Full post to SIGNALFULL + announce to SIGNALANNOUNCE.
+#
+# Group lists:
+#   Comma-separated group IDs from env SIGNALFULL / SIGNALANNOUNCE, or
+#   from a config file (one per line) at ~/av/doc/reference/signal-groups.txt
+#   with sections [full] and [announce].
+#   A SET env var is authoritative; an explicitly EMPTY value means "no
+#   groups" for that mode (it does NOT fall back to the file), so you can
+#   scope to one mode by exporting the other to empty.
+#
+# Legacy manual mode:
+#   hydra-signal -g GROUP_ID "message"   (text-only, no essay)
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+SCRIPT_NAME=$(basename "$0")
+LOG_DIR="$HOME/av/log"
+LOG_FILE="${LOG_DIR}/${SCRIPT_NAME}-$(date +%Y-%m-%d).log"
+GROUP_FILE="$HOME/av/doc/reference/signal-groups.txt"
+ASSEMBLE_FULL="$HOME/av/bin/hydra/publish/signal-assemble-full.py"
+ASSEMBLE_ANNOUNCE="$HOME/av/bin/hydra/publish/signal-assemble-announce.py"
+# The assemblers + shared module use `X | None` type syntax, which requires
+# Python >= 3.10. Bare `python3` on this machine is 3.9; use the hydra venv
+# (3.14) so the signal_arweave annotations don't raise TypeError.
+ASSEMBLE_PY="${ASSEMBLE_PY:-$HOME/av/venv/hydra/bin/python3}"
+
+# signal-cli binary: use the JVM build (not the brew native-image build).
+# The native-image (SubstrateVM) build cannot load libawt for image dimension
+# probing, so attachment sends fail with UnsatisfiedLinkError. The JVM build
+# honors JAVA_TOOL_OPTIONS with -Djava.library.path pointing at the JDK lib/
+# (where libawt.dylib lives). Verified 2026-08-13 with signal-cli 0.14.7.
+SIGNAL_CLI="${SIGNAL_CLI:-$HOME/av/tmp/signal-cli-jvm/signal-cli-0.14.7/bin/signal-cli}"
+JAVA_HOME_DEFAULT="/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home"
+JAVA_LIB_PATH="${JAVA_LIB_PATH:-$JAVA_HOME_DEFAULT/lib}"
+export JAVA_HOME="${JAVA_HOME:-$JAVA_HOME_DEFAULT}"
+export JAVA_TOOL_OPTIONS="-Djava.library.path=$JAVA_LIB_PATH ${JAVA_TOOL_OPTIONS:-}"
+
+mkdir -p "$LOG_DIR"
+
+# ── Logging & Redirection ───────────────────────────────────────────────────
+exec 4>&1
+exec 2>>"$LOG_FILE"
+exec >>"$LOG_FILE"
+
+log_msg() {
+    local level="$1"
+    shift
+    echo "[$level] [$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
+# ── Cleanup & Heartbeat (only for long sends) ───────────────────────────────
+heartbeat() {
+    while true; do
+        sleep 60
+        log_msg "HEARTBEAT" "${SCRIPT_NAME} is still running..."
+    done
+}
+
+cleanup() {
+    local exit_code=$?
+    log_msg "INFO" "Shutting down ${SCRIPT_NAME} (Exit Code: ${exit_code})."
+    [[ -n "${HB_PID:-}" ]] && kill "$HB_PID" 2>/dev/null || true
+}
+
+trap cleanup EXIT
+
+# ── Help Documentation ───────────────────────────────────────────────────────
+show_help() {
+    cat <<'EOF' >&4
+NAME
+    hydra-signal -- send essay posts/announcements to Signal groups
+
+SYNOPSIS
+    hydra-signal --full SLUG | --announce SLUG | --both SLUG [--dry-run]
+    hydra-signal -g GROUP_ID [MESSAGE]
+
+DESCRIPTION
+    Sends essay content to Signal groups via signal-cli.
+
+    --full SLUG      Full post text + hero image + inline images to the
+                     SIGNALFULL group list.
+    --announce SLUG  Announcement (title, first paragraph, post URL,
+                     contact page link, hero image) to the
+                     SIGNALANNOUNCE group list.
+    --both SLUG      Both of the above (default when SLUG is given).
+    --arweave        Source attached images from Arweave (download the
+                     permanent copy + transcode WebP->JPEG before attach).
+    --pdf            Attach the essay as ONE PDF/A-2b document instead of
+                     the default EPUB (sent as its own follow-up message).
+    --epub           Attach the essay as one EPUB3 document (the DEFAULT;
+                     sent as its own follow-up message).
+    --no-doc         Send only the card (no PDF/EPUB attachment).
+    -g GROUP_ID      Manual text send to one group (legacy mode).
+    --dry-run        Print what would be sent; do not send.
+
+GROUP LISTS
+    env SIGNALFULL and SIGNALANNOUNCE: comma-separated base64 group IDs.
+    A SET env var is authoritative; an explicitly EMPTY value means
+    \"no groups\" for that mode (does not fall back to the file).
+    Fallback: ~/av/doc/reference/signal-groups.txt
+        [full]
+        <group-id>
+        [announce]
+        <group-id>
+
+EXAMPLES
+    hydra-signal --full 2026-08-13-my-essay
+    hydra-signal --announce 2026-08-13-my-essay
+    hydra-signal --both 2026-08-13-my-essay
+    echo "Hello" | hydra-signal -g "group_id_123"
+
+SEE ALSO
+    hydra-publish(1), signal-cli(1)
+EOF
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+require_signal() {
+    if ! command -v signal-cli &>/dev/null; then
+        log_msg "ERROR" "signal-cli not found. Please install it via Homebrew."
+        echo "Error: signal-cli not found." >&4
+        exit 1
+    fi
+    if [[ -z "${SIGNAL_USERNAME:-}" ]]; then
+        log_msg "ERROR" "SIGNAL_USERNAME not set."
+        echo "Error: SIGNAL_USERNAME not set. Export it in your shell." >&4
+        exit 1
+    fi
+}
+
+# Resolve group list: an env var that is SET is authoritative (even empty =
+# "no groups", never falling back to the file); only an UNSET env var reads
+# the [section] in GROUP_FILE.
+group_list() {
+    local section="$1"
+    local env_var="$2"
+    local -a groups=()
+    if [[ -n "${!env_var+x}" ]]; then
+        # Env var set (authoritative). Empty value => no groups for this
+        # mode; deliberately do NOT fall back to the file, so an
+        # explicitly-empty SIGNALFULL/SIGNALANNOUNCE can't fan out.
+        if [[ -n "${!env_var}" ]]; then
+            IFS=',' read -r -a groups <<< "${!env_var}"
+        fi
+    elif [[ -f "$GROUP_FILE" ]]; then
+        local in_section=0
+        while IFS= read -r line; do
+            line=$(echo "$line" | tr -d '[:space:]')
+            [[ -z "$line" ]] && continue
+            if [[ "$line" == "[$section]" ]]; then
+                in_section=1
+                continue
+            fi
+            if [[ "$line" =~ ^\[.*\]$ ]]; then
+                in_section=0
+                continue
+            fi
+            [[ "$in_section" == "1" ]] && groups+=("$line")
+        done < "$GROUP_FILE"
+    fi
+    if [[ ${#groups[@]} -eq 0 ]]; then
+        log_msg "INFO" "No groups for [$section] (env $env_var empty/unset or no file match)."
+        return 0   # no groups => this mode is skipped (no sends)
+    fi
+    printf '%s\n' "${groups[@]}"
+}
+
+send_to_groups() {
+    local msg_file="$1"
+    shift
+    # Groups = consecutive args until '--' separator; attachments after
+    local -a groups=()
+    local -a attach=()
+    local sep_seen=0
+    for arg in "$@"; do
+        if [[ "$arg" == "--" ]]; then
+            sep_seen=1
+            continue
+        fi
+        if [[ "$sep_seen" == "1" ]]; then
+            attach+=("$arg")
+        else
+            groups+=("$arg")
+        fi
+    done
+    local ok=0
+    for gid in "${groups[@]}"; do
+        log_msg "INFO" "Sending to group ${gid} (${#attach[@]} attachment(s))."
+        local -a cmd=("$SIGNAL_CLI" -u "$SIGNAL_USERNAME" send --group "$gid"
+                      --message-from-stdin)
+        [[ ${#attach[@]} -gt 0 ]] && cmd+=(-a "${attach[@]}")
+        if [[ "${DRY_RUN:-0}" == "1" ]]; then
+            echo "[dry-run] would send to ${gid}: ${cmd[*]} < $msg_file" >&4
+            continue
+        fi
+        if "${cmd[@]}" < "$msg_file"; then
+            log_msg "SUCCESS" "Sent to ${gid}."
+            echo "Sent to ${gid}" >&4
+        else
+            log_msg "ERROR" "Failed to send to ${gid}."
+            echo "Failed to send to ${gid}" >&4
+            ok=1
+        fi
+    done
+    return "$ok"
+}
+
+# ── Mode: full post ───────────────────────────────────────────────────────────
+do_full() {
+    local slug="$1"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local msg="$tmpdir/msg.txt"
+    local imgs="$tmpdir/imgs.txt"
+    local docfile="$tmpdir/doc.txt"
+    local docflag="" doclabel="" docmodeflag=""
+    case "$DOC_MODE" in
+        pdf)
+            docflag="--pdf-file $docfile"
+            doclabel="PDF"
+            docmodeflag="--pdf"
+            ;;
+        epub)
+            docflag="--epub-file $docfile"
+            doclabel="EPUB"
+            docmodeflag="--epub"
+            ;;
+        none)
+            docflag=""
+            doclabel=""
+            docmodeflag=""
+            ;;
+    esac
+    SIGNAL_TMPDIR="$tmpdir" "$ASSEMBLE_PY" "$ASSEMBLE_FULL" "$slug" \
+        --images-file "$imgs" $docflag $ARWEAVE_FLAG $docmodeflag > "$msg" || {
+        log_msg "ERROR" "assemble-full failed for $slug."
+        echo "Error: could not assemble full post for $slug" >&4
+        rm -rf "$tmpdir"
+        exit 1
+    }
+    local -a attach=()
+    if [[ -s "$imgs" ]]; then
+        while IFS= read -r img; do
+            [[ -n "$img" ]] && attach+=("$img")
+        done < "$imgs"
+    fi
+    local -a full_groups=()
+    while IFS= read -r g; do
+        [[ -n "$g" ]] && full_groups+=("$g")
+    done < <(group_list full SIGNALFULL)
+    send_to_groups "$msg" "${full_groups[@]}" -- "${attach[@]}" || {
+        rm -rf "$tmpdir"
+        exit 1
+    }
+    # The PDF/EPUB goes out as its OWN follow-up message so the Signal
+    # client renders it as a clear downloadable document. Bundling it with
+    # the card (which carries the archerships link) hid it behind the URL
+    # link preview.
+    if [[ -n "$doclabel" && -s "$docfile" ]]; then
+        while IFS= read -r dp; do
+            [[ -n "$dp" ]] || continue
+            local docmsg="$tmpdir/doc-msg.txt"
+            printf '%s: %s\n' "$doclabel" "$(basename "$dp")" > "$docmsg"
+            send_to_groups "$docmsg" "${full_groups[@]}" -- "$dp" || {
+                rm -rf "$tmpdir"
+                exit 1
+            }
+        done < "$docfile"
+    fi
+    rm -rf "$tmpdir"
+}
+
+# ── Mode: announce ────────────────────────────────────────────────────────────
+do_announce() {
+    local slug="$1"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local msg="$tmpdir/msg.txt"
+    local imgs="$tmpdir/imgs.txt"
+    SIGNAL_TMPDIR="$tmpdir" "$ASSEMBLE_PY" "$ASSEMBLE_ANNOUNCE" "$slug" --images-file "$imgs" $ARWEAVE_FLAG > "$msg" || {
+        log_msg "ERROR" "assemble-announce failed for $slug."
+        echo "Error: could not assemble announcement for $slug" >&4
+        rm -rf "$tmpdir"
+        exit 1
+    }
+    local -a attach=()
+    if [[ -s "$imgs" ]]; then
+        while IFS= read -r img; do
+            [[ -n "$img" ]] && attach+=("$img")
+        done < "$imgs"
+    fi
+    local -a ann_groups=()
+    while IFS= read -r g; do
+        [[ -n "$g" ]] && ann_groups+=("$g")
+    done < <(group_list announce SIGNALANNOUNCE)
+    send_to_groups "$msg" "${ann_groups[@]}" -- "${attach[@]}" || {
+        rm -rf "$tmpdir"
+        exit 1
+    }
+    rm -rf "$tmpdir"
+}
+
+# ── Main Logic ────────────────────────────────────────────────────────────────
+log_msg "INFO" "Starting ${SCRIPT_NAME}."
+
+MODE=""
+SLUG=""
+DRY_RUN=0
+ARWEAVE_FLAG=""
+# Document attachment mode: default EPUB, --pdf overrides, --no-doc sends the
+# card only.
+DOC_MODE="epub"
+GROUPS=()
+MESSAGE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --full)
+            MODE="full"
+            SLUG="$2"
+            shift 2
+            ;;
+        --announce)
+            MODE="announce"
+            SLUG="$2"
+            shift 2
+            ;;
+        --both)
+            MODE="both"
+            SLUG="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --arweave)
+            ARWEAVE_FLAG="--arweave"
+            shift
+            ;;
+        --pdf)
+            DOC_MODE="pdf"
+            shift
+            ;;
+        --epub)
+            DOC_MODE="epub"
+            shift
+            ;;
+        --no-doc)
+            DOC_MODE="none"
+            shift
+            ;;
+        -g|--group)
+            GROUPS+=("$2")
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            if [[ -z "$MESSAGE" ]]; then
+                MESSAGE="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+require_signal
+
+# Legacy manual mode: -g with message (no slug)
+if [[ -n "$MODE" && -z "$SLUG" ]]; then
+    log_msg "ERROR" "--full/--announce/--both require a SLUG."
+    echo "Error: SLUG required with --full/--announce/--both" >&4
+    exit 2
+fi
+
+if [[ -n "$MODE" ]]; then
+    if [[ "$MODE" == "full" || "$MODE" == "both" ]]; then
+        do_full "$SLUG"
+    fi
+    if [[ "$MODE" == "announce" || "$MODE" == "both" ]]; then
+        do_announce "$SLUG"
+    fi
+    log_msg "INFO" "Finished ${MODE} for ${SLUG}."
+    exit 0
+fi
+
+# Legacy manual mode
+if [[ ${#GROUPS[@]} -eq 0 ]]; then
+    log_msg "ERROR" "No mode or group specified."
+    echo "Error: use --full/--announce/--both SLUG, or -g GROUP_ID" >&4
+    exit 2
+fi
+
+if [[ -z "$MESSAGE" ]]; then
+    log_msg "INFO" "Reading message from stdin."
+    MESSAGE=$(cat)
+fi
+
+if [[ -z "$MESSAGE" ]]; then
+    log_msg "ERROR" "Empty message."
+    echo "Error: message cannot be empty" >&4
+    exit 2
+fi
+
+for GROUP_ID in "${GROUPS[@]}"; do
+    log_msg "INFO" "Sending message to group: ${GROUP_ID}"
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo "[dry-run] would send to ${GROUP_ID}: $MESSAGE" >&4
+        continue
+    fi
+    if "$SIGNAL_CLI" -u "$SIGNAL_USERNAME" send --group "$GROUP_ID" -m "$MESSAGE"; then
+        log_msg "SUCCESS" "Message sent to ${GROUP_ID}."
+        echo "Successfully sent to ${GROUP_ID}" >&4
+    else
+        log_msg "ERROR" "Failed to send to ${GROUP_ID}."
+        echo "Failed to send to ${GROUP_ID}" >&4
+        exit 1
+    fi
+done
+
+log_msg "INFO" "Finished all tasks successfully."

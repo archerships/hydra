@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# x-import -- Full historical archive of one or more X/Twitter accounts.
+#
+# Downloads the complete tweet history for each handle, including media.
+# Stops automatically if a prior archive exists (uses --full to override).
+# On re-run without --full, only new tweets since the last archived ID are fetched.
+#
+# Wraps twitness/tw-archive.py via Nix for reproducible dependencies.
+#
+# Usage: x-import [--full] [--no-media] HANDLE [HANDLE ...]
+#        x-import [--full] [--no-media] --file handles.txt
+#
+# Options:
+#   --full       Backfill to the account's first tweet (slow; use once)
+#   --no-media   Skip image/video downloads
+#   --file FILE  File with one handle per line
+#
+# Output: ~/av/ast/archive/twitter/{handle}/
+
+set -euo pipefail
+
+ARCHIVE_PY="${HOME}/av/prj/twitness/src/tw-archive.py"
+
+if [[ ! -f "${ARCHIVE_PY}" ]]; then
+    echo "[x-import] ERROR: ${ARCHIVE_PY} not found." >&2
+    exit 1
+fi
+
+exec nix shell \
+    nixpkgs#python313Packages.httpx \
+    nixpkgs#python313Packages.beautifulsoup4 \
+    nixpkgs#python313Packages.warcio \
+    nixpkgs#python313Packages.playwright \
+    nixpkgs#python313Packages.aiohttp \
+    --command python3 "${ARCHIVE_PY}" --full "$@"

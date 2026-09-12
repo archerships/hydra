@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""
+nostr-sync -- Incremental Nostr event sync (new events since last import).
+
+Fetches kind-1 (notes) and kind-30023 (long-form articles) published after
+the timestamp recorded by the previous nostr-import or nostr-sync run.
+
+Safe to run on a schedule. On first run with no checkpoint, fetches the
+last 30 days. Use nostr-import for a complete historical backfill.
+
+Usage:
+  nostr-sync.py [--pubkey HEX] [--kinds K[,K...]] [--relays R[,R...]]
+                [--since YYYY-MM-DD] [--output DIR] [--dry-run]
+
+Options:
+  --pubkey HEX      Hex public key (default: derived from keychain private key)
+  --kinds K[,K...]  Event kinds to sync (default: 1,30023)
+  --relays R[,R...] Relay URLs (default: built-in list)
+  --since DATE      Override checkpoint with this date (YYYY-MM-DD)
+  --output DIR      Output directory (default: ~/av/doc/nostr)
+  --dry-run         Print nak command without executing
+
+Requirements:
+  nak  (go install github.com/fiatjaf/nak@latest; ~/go/bin must be on PATH)
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+DEFAULT_RELAYS = [
+    "wss://relay.damus.io",
+    "wss://relay.primal.net",
+    "wss://nos.lol",
+    "wss://relay.nostr.band",
+]
+DEFAULT_KINDS = [1, 30023]
+OUT_BASE = Path.home() / "av/doc/nostr"
+CHECKPOINT = OUT_BASE / ".last-import"
+DEFAULT_LOOKBACK_DAYS = 30
+
+
+def find_nak() -> str:
+    nak = shutil.which("nak") or os.path.expanduser("~/go/bin/nak")
+    if not Path(nak).exists():
+        print(
+            "[nostr-sync] ERROR: nak not found.\n"
+            "  Install: go install github.com/fiatjaf/nak@latest",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return nak
+
+
+def get_pubkey(nak: str) -> str | None:
+    try:
+        import keyring
+        privkey = keyring.get_password("nostr", "private_key")
+        if privkey:
+            result = subprocess.run(
+                [nak, "key", "public", privkey],
+                capture_output=True, text=True, check=True,
+            )
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def load_checkpoint(since_override: str | None) -> int:
+    if since_override:
+        dt = datetime.fromisoformat(since_override).replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+
+    if CHECKPOINT.exists():
+        try:
+            ts_str = CHECKPOINT.read_text().strip()
+            dt = datetime.fromisoformat(ts_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except (ValueError, OSError):
+            pass
+
+    fallback = datetime.now(tz=timezone.utc) - timedelta(days=DEFAULT_LOOKBACK_DAYS)
+    return int(fallback.timestamp())
+
+
+def fetch_events(nak: str, pubkey: str, kinds: list[int], relays: list[str],
+                 since_ts: int, dry_run: bool) -> list[dict]:
+    kind_args = []
+    for k in kinds:
+        kind_args += ["-k", str(k)]
+
+    cmd = [nak, "req", "-a", pubkey, "--stream", "--since", str(since_ts)] + kind_args + relays
+
+    if dry_run:
+        print("[nostr-sync] Would run:", " ".join(cmd))
+        return []
+
+    since_iso = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
+    print(f"[nostr-sync] Fetching events since {since_iso} from {len(relays)} relays...")
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+    events = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    return events
+
+
+def save_event(event: dict, out_dir: Path) -> str:
+    kind = event.get("kind", 0)
+    created = event.get("created_at", 0)
+    event_id = event.get("id", "unknown")
+
+    dt = datetime.fromtimestamp(created, tz=timezone.utc)
+    date_str = dt.strftime("%Y-%m-%d")
+    slug = f"{date_str}-{event_id[:16]}"
+
+    kind_dir = out_dir / f"kind-{kind}"
+    kind_dir.mkdir(parents=True, exist_ok=True)
+    out_path = kind_dir / f"{slug}.json"
+    out_path.write_text(json.dumps(event, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    return dt.isoformat()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Incremental Nostr event sync")
+    parser.add_argument("--pubkey", help="Hex public key")
+    parser.add_argument("--kinds", default=",".join(str(k) for k in DEFAULT_KINDS))
+    parser.add_argument("--relays", default=",".join(DEFAULT_RELAYS))
+    parser.add_argument("--since", help="Override checkpoint (YYYY-MM-DD)")
+    parser.add_argument("--output", default=str(OUT_BASE))
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    nak = find_nak()
+    out_dir = Path(args.output).expanduser()
+
+    pubkey = args.pubkey or get_pubkey(nak)
+    if not pubkey:
+        print(
+            "[nostr-sync] ERROR: no pubkey. Pass --pubkey HEX or store private key in keychain.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    kinds = [int(k) for k in args.kinds.split(",")]
+    relays = [r.strip() for r in args.relays.split(",")]
+    since_ts = load_checkpoint(args.since)
+
+    events = fetch_events(nak, pubkey, kinds, relays, since_ts, args.dry_run)
+
+    if not events:
+        if not args.dry_run:
+            print("[nostr-sync] No new events.")
+        return
+
+    print(f"[nostr-sync] {len(events)} new events received.")
+
+    seen = set()
+    saved = 0
+    newest = None
+
+    for event in events:
+        eid = event.get("id")
+        if eid in seen:
+            continue
+        seen.add(eid)
+
+        ts = save_event(event, out_dir)
+        saved += 1
+        if newest is None or ts > newest:
+            newest = ts
+
+    if newest and not args.dry_run:
+        CHECKPOINT.write_text(newest)
+
+    print(f"[nostr-sync] {saved} events saved to {out_dir}")
+    if newest:
+        print(f"[nostr-sync] Checkpoint updated: {newest}")
+
+
+if __name__ == "__main__":
+    main()

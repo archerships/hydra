@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""
+substack-sync -- Incremental sync of Substack content to local filesystem.
+
+Fetches only posts published after the last checkpoint. On first run with no
+checkpoint, fetches the most recent 50 posts (use substack-import for a full
+historical backfill).
+
+Checkpoint: ~/av/doc/substack/.last-sync (ISO 8601 UTC timestamp)
+Output:     ~/av/doc/substack/posts/ and ~/av/doc/substack/podcasts/
+
+Usage:
+  substack-sync [--url URL] [--limit N] [--full]
+
+Options:
+  --url URL    Substack URL (default: https://archerships.substack.com)
+  --limit N    Maximum posts to fetch per run (default: 50; ignored with --full)
+  --full       Ignore checkpoint; fetch all posts (same as substack-import)
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from substack_api.newsletter import Newsletter
+from substack_api.post import Post
+
+DEFAULT_URL = "https://archerships.substack.com"
+BASE_DIR = Path.home() / "av/doc/substack"
+POSTS_DIR = BASE_DIR / "posts"
+PODCASTS_DIR = BASE_DIR / "podcasts"
+CHECKPOINT = BASE_DIR / ".last-sync"
+
+
+def load_checkpoint() -> datetime | None:
+    if CHECKPOINT.exists():
+        try:
+            ts = CHECKPOINT.read_text().strip()
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def write_checkpoint(dt: datetime) -> None:
+    CHECKPOINT.write_text(dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+
+def save_post(post_obj, target_dir: Path) -> bool:
+    try:
+        metadata = post_obj.get_metadata()
+        slug = metadata.get("slug", "untitled")
+        title = metadata.get("title", "Untitled")
+        date = metadata.get("post_date", "unknown")
+
+        post_path = target_dir / slug
+        post_path.mkdir(parents=True, exist_ok=True)
+
+        (post_path / "metadata.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8"
+        )
+
+        content = post_obj.get_content()
+        if content:
+            html = f"<!-- TITLE: {title} -->\n<!-- DATE: {date} -->\n{content}"
+            (post_path / "content.html").write_text(html, encoding="utf-8")
+
+        print(f"  [OK] {slug}")
+        return True
+    except Exception as e:
+        print(f"  [ERROR] {e}", file=sys.stderr)
+        return False
+
+
+def parse_post_date(metadata: dict) -> datetime | None:
+    raw = metadata.get("post_date")
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Incremental Substack sync")
+    parser.add_argument("--url", default=DEFAULT_URL)
+    parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument("--full", action="store_true")
+    args = parser.parse_args()
+
+    POSTS_DIR.mkdir(parents=True, exist_ok=True)
+    PODCASTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    checkpoint = None if args.full else load_checkpoint()
+    if checkpoint:
+        print(f"[substack-sync] Fetching posts since {checkpoint.isoformat()}")
+    else:
+        print(f"[substack-sync] No checkpoint; fetching up to {args.limit} posts")
+
+    nl = Newsletter(args.url)
+    limit = None if args.full else args.limit
+    posts = nl.get_posts(limit=limit)
+
+    newest = None
+    saved = 0
+    skipped = 0
+
+    for p in posts:
+        meta = p.get_metadata()
+        post_date = parse_post_date(meta)
+
+        if checkpoint and post_date and post_date <= checkpoint:
+            skipped += 1
+            continue
+
+        if post_date and (newest is None or post_date > newest):
+            newest = post_date
+
+        if save_post(p, POSTS_DIR):
+            saved += 1
+        time.sleep(1)
+
+    print(f"[substack-sync] Posts: {saved} saved, {skipped} already current")
+
+    if newest:
+        write_checkpoint(newest)
+        print(f"[substack-sync] Checkpoint updated: {newest.isoformat()}")
+
+    print("[substack-sync] Done.")
+
+
+if __name__ == "__main__":
+    main()

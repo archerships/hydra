@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""
+tw-archive -- Archive a Twitter/X account via Playwright + Brave CDP session.
+
+Connects to an existing Brave browser on --cdp-url (default localhost:9222),
+navigates to each handle's profile, scrolls the entire timeline, and saves
+all tweets to ~/av/ast/archive/twitter/<handle>/feed.json (cumulative,
+deduplicated by tweet ID).
+
+REQUIRES:
+    Brave running with remote debugging enabled:
+        brave-browser --remote-debugging-port=9222
+
+USAGE:
+    tw-archive HANDLE [HANDLE ...]
+    tw-archive --help
+
+OPTIONS:
+    --cdp-url URL       CDP endpoint (default: http://localhost:9222)
+    --output DIR        Output directory (default: ~/av/ast/archive/twitter)
+    --no-media          Skip downloading media (images/video thumbnails)
+    --no-replies        Skip capturing top-level reply metadata
+    --limit N           Stop after N new tweets (0 = no limit, default: 0)
+    -v, --verbose       Show each tweet as it is captured
+
+SEE ALSO:
+    doc/ai/twitter-archive-spec.md, nitter-archive
+"""
+
+import argparse
+import asyncio
+import json
+import mimetypes
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+try:
+    from playwright.async_api import async_playwright
+except ImportError:
+    sys.exit("playwright not installed. Run: pip install playwright && playwright install chromium")
+
+try:
+    from playwright_stealth.stealth import Stealth
+    HAS_STEALTH = True
+except ImportError:
+    HAS_STEALTH = False
+
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
+
+CDP_URL     = "http://localhost:9222"
+OUTPUT_DIR  = Path.home() / "av" / "ast" / "archive" / "twitter"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def ts():
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+def log(msg, verbose=True):
+    if verbose:
+        print(f"[{ts()}] {msg}", flush=True)
+
+def load_feed(path: Path):
+    if path.exists():
+        try:
+            d = json.loads(path.read_text())
+            return d.get("tweets", [])
+        except Exception:
+            pass
+    return []
+
+def save_feed(path: Path, handle: str, tweets: list):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"handle": handle, "tweets": tweets}, indent=2))
+
+def merge_feeds(new_tweets: list, existing: list) -> tuple[list, int]:
+    """Prepend new tweets; return (merged, added_count)."""
+    known = {t["id"] for t in existing if t.get("id")}
+    truly_new = [t for t in new_tweets if t.get("id") and t["id"] not in known]
+    return truly_new + existing, len(truly_new)
+
+# ---------------------------------------------------------------------------
+# Media download
+# ---------------------------------------------------------------------------
+
+async def download_media(tweets: list, media_dir: Path, verbose: bool) -> int:
+    """
+    Download media files for a list of tweets into media_dir.
+    Files are named <tweet_id>-<n>.<ext>.
+    Returns count of files successfully downloaded.
+    """
+    if not HAS_AIOHTTP:
+        log("  aiohttp not installed — skipping media download (pip install aiohttp)", True)
+        return 0
+
+    media_dir.mkdir(parents=True, exist_ok=True)
+    downloaded = 0
+
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        for t in tweets:
+            for i, url in enumerate(t.get("media_urls", [])):
+                # Derive extension from URL path; fall back to .jpg
+                parsed_path = urlparse(url).path
+                ext = Path(parsed_path).suffix or ".jpg"
+                # Twitter CDN URLs often have query params like ?format=jpg&name=large
+                qs = urlparse(url).query
+                fmt_match = re.search(r"format=(\w+)", qs)
+                if fmt_match:
+                    ext = "." + fmt_match.group(1)
+
+                fname = media_dir / f"{t['id']}-{i}{ext}"
+                if fname.exists():
+                    continue  # already downloaded (re-run safety)
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status == 200:
+                            fname.write_bytes(await resp.read())
+                            downloaded += 1
+                            if verbose:
+                                print(f"    media [{downloaded}] {fname.name}", flush=True)
+                        else:
+                            log(f"  media {url} -> HTTP {resp.status}", verbose)
+                except Exception as e:
+                    log(f"  media download failed {url}: {e}", verbose)
+
+    return downloaded
+
+# ---------------------------------------------------------------------------
+# Tweet extraction from a single article element
+# ---------------------------------------------------------------------------
+
+async def extract_tweet(article, handle: str) -> dict | None:
+    """Extract structured data from an article[data-testid=tweet] element."""
+    try:
+        # Tweet link / ID — must belong to this handle
+        link_el = await article.query_selector('a[href*="/status/"]')
+        if not link_el:
+            return None
+        href = await link_el.get_attribute("href") or ""
+        m = re.search(r"/([^/]+)/status/(\d+)", href)
+        if not m:
+            return None
+        author, tweet_id = m.group(1), m.group(2)
+
+        # Date
+        time_el = await article.query_selector("time")
+        date = await time_el.get_attribute("datetime") if time_el else ""
+
+        # Text
+        text_el = await article.query_selector('div[data-testid="tweetText"]')
+        text = (await text_el.inner_text()).strip() if text_el else ""
+
+        # Media image URLs (thumbnails for videos included)
+        img_els = await article.query_selector_all(
+            'div[data-testid="tweetPhoto"] img, div[data-testid="videoPlayer"] img'
+        )
+        media_urls = []
+        for img in img_els:
+            src = await img.get_attribute("src") or ""
+            if src and src not in media_urls:
+                media_urls.append(src)
+
+        # Retweet / quote metadata
+        is_retweet = bool(await article.query_selector('div[data-testid="socialContext"]'))
+
+        return {
+            "id":         tweet_id,
+            "url":        f"https://x.com/{author}/status/{tweet_id}",
+            "author":     author,
+            "date":       date,
+            "text":       text,
+            "media_urls": media_urls,
+            "is_retweet": is_retweet,
+        }
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
+# Scroll the timeline and collect all visible tweets
+# ---------------------------------------------------------------------------
+
+async def scroll_timeline(page, handle: str, existing_ids: set, limit: int, verbose: bool) -> list:
+    """
+    Scroll the full profile timeline, collecting tweets not in existing_ids.
+    Stops when:
+      - We've hit `limit` new tweets (if limit > 0)
+      - No new tweets appear after several scroll attempts (end of timeline)
+      - We encounter existing_ids (incremental run has caught up)
+    """
+    tweets    = []
+    seen_ids  = set()
+    stale     = 0          # consecutive scrolls yielding nothing new
+    MAX_STALE = 5
+
+    log(f"Starting scroll for @{handle}...", verbose)
+
+    while stale < MAX_STALE:
+        if limit > 0 and len(tweets) >= limit:
+            log(f"  Reached limit of {limit} new tweets.", verbose)
+            break
+
+        articles = await page.query_selector_all('article[data-testid="tweet"]')
+        new_this_pass = 0
+
+        for article in articles:
+            t = await extract_tweet(article, handle)
+            if not t or t["id"] in seen_ids:
+                continue
+            seen_ids.add(t["id"])
+
+            if t["id"] in existing_ids:
+                log(f"  Reached known tweet {t['id']} — incremental catch-up complete.", verbose)
+                return tweets
+
+            tweets.append(t)
+            new_this_pass += 1
+            if verbose:
+                prefix = "RT" if t["is_retweet"] else "  "
+                print(f"  {prefix} [{len(tweets):>4}] {t['id']}  {t['date'][:10]}  {t['text'][:70]}", flush=True)
+
+            if limit > 0 and len(tweets) >= limit:
+                break
+
+        if new_this_pass == 0:
+            stale += 1
+            log(f"  No new tweets (stale={stale}/{MAX_STALE}).", verbose)
+        else:
+            stale = 0
+
+        # Scroll down two viewport-heights; wait for lazy content to load
+        await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
+        await asyncio.sleep(2.5 if stale == 0 else 4)
+
+    log(f"  End of timeline reached ({len(tweets)} tweets collected).", verbose)
+    return tweets
+
+# ---------------------------------------------------------------------------
+# Optional: capture reply metadata for a single tweet page
+# ---------------------------------------------------------------------------
+
+async def capture_replies(context, tweet_url: str, verbose: bool) -> list:
+    """Open tweet page, collect top-level replies (excluding the original tweet)."""
+    page = await context.new_page()
+    replies = []
+    try:
+        await page.goto(tweet_url, wait_until="domcontentloaded", timeout=20_000)
+        await asyncio.sleep(3)
+        await page.evaluate("window.scrollBy(0, 600)")
+        await asyncio.sleep(2)
+
+        articles = await page.query_selector_all('article[data-testid="tweet"]')
+        for article in articles[1:]:   # skip first (the original tweet)
+            try:
+                author_el = await article.query_selector('div[data-testid="User-Name"] a')
+                author    = (await author_el.get_attribute("href") or "").lstrip("/")
+                text_el   = await article.query_selector('div[data-testid="tweetText"]')
+                text      = (await text_el.inner_text()).strip() if text_el else ""
+                link_el   = await article.query_selector('a[href*="/status/"]')
+                href      = await link_el.get_attribute("href") if link_el else ""
+                reply_id  = href.split("/status/")[-1].split("?")[0] if href else ""
+                if reply_id:
+                    replies.append({
+                        "id":     reply_id,
+                        "author": author,
+                        "url":    f"https://x.com{href}",
+                        "text":   text,
+                    })
+            except Exception:
+                continue
+    except Exception as e:
+        log(f"  Reply fetch failed for {tweet_url}: {e}", verbose)
+    finally:
+        await page.close()
+    return replies
+
+# ---------------------------------------------------------------------------
+# Archive one handle
+# ---------------------------------------------------------------------------
+
+async def archive_handle(handle: str, context, output_dir: Path, opts: argparse.Namespace):
+    handle = handle.lstrip("@")
+    verbose = opts.verbose
+
+    cumulative = output_dir / handle / "feed.json"
+    date_dir   = output_dir / handle / datetime.now().strftime("%Y-%m-%d")
+    date_dir.mkdir(parents=True, exist_ok=True)
+    snapshot   = date_dir / "feed.json"
+
+    existing = load_feed(cumulative)
+    existing_ids = {t["id"] for t in existing if t.get("id")}
+    log(f"=== @{handle}: {len(existing_ids)} tweets already in archive ===", True)
+
+    page = await context.new_page()
+    if HAS_STEALTH:
+        await Stealth().apply_stealth_async(page)
+
+    try:
+        profile_url = f"https://x.com/{handle}"
+        log(f"  Navigating to {profile_url}", verbose)
+        await page.goto(profile_url, wait_until="domcontentloaded", timeout=30_000)
+        await asyncio.sleep(3)
+
+        # Check we landed on a real profile
+        title = await page.title()
+        if "Page not found" in title or "/ X" not in title and handle.lower() not in title.lower():
+            log(f"  WARNING: unexpected page title: {title!r}", True)
+
+        new_tweets = await scroll_timeline(page, handle, existing_ids, opts.limit, verbose)
+    finally:
+        await page.close()
+
+    # Optional: download media files
+    if new_tweets and not opts.no_media:
+        media_dir = date_dir / "media"
+        log(f"  Downloading media for {len(new_tweets)} new tweets...", verbose)
+        n = await download_media(new_tweets, media_dir, verbose)
+        log(f"  Downloaded {n} media file(s) to {media_dir}", verbose)
+
+    # Optional: fetch reply metadata for each new tweet
+    if new_tweets and not opts.no_replies:
+        log(f"  Fetching replies for {len(new_tweets)} new tweets...", verbose)
+        for t in new_tweets:
+            t["replies"] = await capture_replies(context, t["url"], verbose)
+            await asyncio.sleep(1.5)
+
+    # Save daily snapshot
+    save_feed(snapshot, handle, new_tweets)
+
+    # Merge into cumulative feed
+    merged, added = merge_feeds(new_tweets, existing)
+    save_feed(cumulative, handle, merged)
+
+    log(f"=== @{handle}: +{added} new tweets ({len(merged)} total). Feed: {cumulative} ===", True)
+    return added
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+async def run(opts: argparse.Namespace):
+    # Verify Brave is reachable
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"{opts.cdp_url}/json/version", timeout=5)
+    except Exception:
+        sys.exit(
+            f"Cannot reach CDP endpoint at {opts.cdp_url}\n\n"
+            "Start Brave with remote debugging:\n"
+            "  open -a 'Brave Browser' --args --remote-debugging-port=9222\n"
+            "Then navigate to x.com and confirm you are logged in."
+        )
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.connect_over_cdp(opts.cdp_url)
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+
+        output_dir = Path(opts.output)
+        failed = 0
+        for handle in opts.handles:
+            try:
+                await archive_handle(handle, context, output_dir, opts)
+            except Exception as e:
+                print(f"[{ts()}] ERROR archiving @{handle}: {e}", file=sys.stderr)
+                failed += 1
+
+        if failed:
+            sys.exit(f"{failed} handle(s) failed.")
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Archive a Twitter/X account via Brave CDP session.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    ap.add_argument("handles", nargs="+", metavar="HANDLE")
+    ap.add_argument("--cdp-url",    default=CDP_URL,       help=f"CDP endpoint (default: {CDP_URL})")
+    ap.add_argument("--output",     default=str(OUTPUT_DIR), help="Output directory")
+    ap.add_argument("--no-media",   action="store_true",   help="Skip media download")
+    ap.add_argument("--no-replies", action="store_true",   help="Skip reply capture")
+    ap.add_argument("--limit",      type=int, default=0,   help="Max new tweets (0=all)")
+    ap.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    opts = ap.parse_args()
+    asyncio.run(run(opts))
+
+if __name__ == "__main__":
+    main()

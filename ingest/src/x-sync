@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# x-sync -- Incremental sync of X/Twitter accounts (new tweets only).
+#
+# Fetches tweets published after the newest tweet already in the local archive.
+# Safe to run on a schedule (cron/launchd); stops as soon as it reaches known content.
+#
+# For a full historical backfill, use x-import --full instead.
+#
+# Wraps twitness/tw-archive.py via Nix for reproducible dependencies.
+#
+# Usage: x-sync [--no-media] HANDLE [HANDLE ...]
+#        x-sync [--no-media] --file handles.txt
+#
+# Options:
+#   --no-media   Skip image/video downloads
+#   --file FILE  File with one handle per line
+#
+# Output: ~/av/ast/archive/twitter/{handle}/
+
+set -euo pipefail
+
+ARCHIVE_PY="${HOME}/av/prj/twitness/src/tw-archive.py"
+
+if [[ ! -f "${ARCHIVE_PY}" ]]; then
+    echo "[x-sync] ERROR: ${ARCHIVE_PY} not found." >&2
+    exit 1
+fi
+
+exec nix shell \
+    nixpkgs#python313Packages.httpx \
+    nixpkgs#python313Packages.beautifulsoup4 \
+    nixpkgs#python313Packages.warcio \
+    nixpkgs#python313Packages.playwright \
+    nixpkgs#python313Packages.aiohttp \
+    --command python3 "${ARCHIVE_PY}" "$@"

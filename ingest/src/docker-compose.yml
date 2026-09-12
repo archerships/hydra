@@ -1,0 +1,57 @@
+version: "3.3"
+
+services:
+  lemmy:
+    image: dessalines/lemmy:0.19.6
+    hostname: lemmy
+    restart: always
+    extra_hosts:
+      - "peertube.localhost:host-gateway"
+    environment:
+      - LEMMY_DATABASE_URL=postgres://lemmy:password@postgres:5432/lemmy
+    volumes:
+      - ../config/lemmy.hjson:/config/config.hjson:ro
+    depends_on:
+      - postgres
+      - pictrs
+
+  lemmy-ui:
+    image: dessalines/lemmy-ui:0.19.6
+    environment:
+      - LEMMY_UI_LEMMY_INTERNAL_HOST=lemmy:8536
+      - LEMMY_UI_LEMMY_EXTERNAL_HOST=http://localhost:8080
+      - LEMMY_UI_HTTPS=false
+    depends_on:
+      - lemmy
+
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ../config/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - lemmy
+      - lemmy-ui
+    restart: always
+
+  postgres:
+    image: postgres:15-alpine
+    hostname: postgres
+    environment:
+      - POSTGRES_USER=lemmy
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=lemmy
+    volumes:
+      - ../data/postgres:/var/lib/postgresql/data
+    restart: always
+
+  pictrs:
+    image: asonix/pictrs:0.4.0
+    hostname: pictrs
+    user: 991:991
+    environment:
+      - PICTRS__MEDIA__VIDEO_CODEC=h264
+    volumes:
+      - ../data/pictrs:/mnt
+    restart: always
