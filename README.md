@@ -167,3 +167,9 @@ frontmatter under `published_at` by `hydra-publish` after a successful post.
 
 See `ingest/doc/01_STATE.md` and `publish/doc/01_STATE.md` for current status,
 open tasks, and blockers for each side.
+
+---
+
+## License
+
+BSD 3-Clause. See [LICENSE](LICENSE).
